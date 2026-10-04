@@ -37,6 +37,7 @@ function extractJsonSafe(text: string): unknown {
 }
 
 const KNOWN_COMPANIES = [
+  "test merchant", // deterministic demo company — always resolves to the sim adapter
   "amazon", "walmart", "target", "best buy", "ebay", "costco", "apple",
   "samsung", "nike", "adidas", "home depot", "lowes", "ikea", "wayfair",
   "chewy", "newegg", "macys", "nordstrom", "zappos", "shein", "temu",
@@ -44,9 +45,10 @@ const KNOWN_COMPANIES = [
 
 function extractObjective(text: string) {
   const lower = text.toLowerCase();
-  const company = KNOWN_COMPANIES.find((c) => lower.includes(c)) ??
+  const known = KNOWN_COMPANIES.find((c) => lower.includes(c));
+  const company = (known ? known.replace(/\b\w/g, (ch) => ch.toUpperCase()) : null) ??
     (lower.match(/(?:order|from|with|to)\s+(?:the\s+)?([A-Z][A-Za-z0-9&.' -]{2,25})/)?.[1]?.trim()) ??
-    (text.match(/([A-Z][A-Za-z0-9&.'-]{2,25})/)?.[1] ?? "unknown company");
+    (text.match(/([A-Z][A-Za-z0-9&.'-]*(?:\s+[A-Z][A-Za-z0-9&.'-]*){0,3})/)?.[1] ?? "unknown company");
   const amountMatch = text.match(/\$\s*(\d+(?:,\d{3})*(?:\.\d{1,2})?)/);
   const amountCents = amountMatch ? Math.round(parseFloat(amountMatch[1]!.replace(/,/g, "")) * 100) : null;
   let issueType = "other_post_purchase";

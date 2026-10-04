@@ -86,7 +86,7 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
     if (!b.text || b.text.trim().length < 5) return err(400, "describe the problem in a sentence or two");
     const { caseId, objective } = await createCaseFromText(env, uid, b.text.trim());
     if (b.scenario) {
-      await run(env.DB, `UPDATE cases SET meta = ? WHERE id = ?`, JSON.stringify({ scenario: b.scenario }), caseId);
+      await run(env.DB, `UPDATE cases SET meta = json_set(COALESCE(meta, '{}'), '$.scenario', ?) WHERE id = ?`, b.scenario, caseId);
     }
     await caseEvent(env.DB, caseId, "intake_completed", "agent", { objective });
     return res({ caseId, objective, suggestedMandate: suggestedMandate(objective) });
@@ -153,8 +153,9 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
       return res({ ok: true });
     }
     if (sub === "/pause" && req.method === "POST") {
+      // Pause freezes work without destroying it: the sweep skips paused cases
+      // and pending follow-ups stay pending until resume.
       await run(env.DB, `UPDATE cases SET paused = 1, updated_at = ? WHERE id = ?`, nowIso(), caseId);
-      await cancelFollowUps(env.DB, caseId);
       await caseEvent(env.DB, caseId, "case_paused", "customer", {});
       return res({ ok: true });
     }
@@ -290,7 +291,27 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
       env.DB,
       `SELECT COALESCE(SUM(cost_micro_usd),0) total, COUNT(DISTINCT case_id) cases
        FROM cost_events WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`, uid);
-    return res({ casesByStatus: cases, costsByCase: costs, totalMicroUsd: agg?.total ?? 0, casesWithCost: agg?.cases ?? 0 });
+    const approvals = await q1<{ n: number }>(
+      env.DB,
+      `SELECT COUNT(*) n FROM approval_requests a JOIN cases c ON c.id = a.case_id WHERE c.user_id = ?`, uid);
+    const followups = await q1<{ n: number; fired: number }>(
+      env.DB,
+      `SELECT COUNT(*) n, COALESCE(SUM(CASE WHEN f.status = 'fired' THEN 1 ELSE 0 END),0) fired
+       FROM follow_ups f JOIN cases c ON c.id = f.case_id WHERE c.user_id = ?`, uid);
+    const byProvider = await q<{ provider: string; n: number; cost: number }>(
+      env.DB,
+      `SELECT COALESCE(provider,'(none)') provider, COUNT(*) n, COALESCE(SUM(cost_micro_usd),0) cost
+       FROM cost_events WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?) GROUP BY provider`, uid);
+    return res({
+      casesByStatus: cases,
+      costsByCase: costs,
+      totalMicroUsd: agg?.total ?? 0,
+      casesWithCost: agg?.cases ?? 0,
+      approvalsTotal: approvals?.n ?? 0,
+      followUpsTotal: followups?.n ?? 0,
+      followUpsFired: followups?.fired ?? 0,
+      byProvider,
+    });
   }
 
   // ---- demo inbound email (dev/test only) ----
@@ -308,6 +329,7 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
 
 async function caseDetail(env: Env, caseId: string) {
   const c = await getCase(env.DB, caseId);
+  const meta = json<{ orderRef?: string; trackingRef?: string; scenario?: string }>((c as Record<string, unknown> | null)?.meta as string | null, {});
   const [claims, evidence, events, messages, mandate, outcome, approvals, actions, followups, costs] =
     await Promise.all([
       listClaims(env.DB, caseId),
@@ -326,6 +348,8 @@ async function caseDetail(env: Env, caseId: string) {
     ]);
   return {
     case: c,
+    orderRef: meta.orderRef ?? null,
+    trackingRef: meta.trackingRef ?? null,
     claims: claims.map((r: Record<string, unknown>) => claimView(r)),
     evidence: evidence.map((r: Record<string, unknown>) => evidenceView(r)),
     events: events.map((r: Record<string, unknown>) => ({

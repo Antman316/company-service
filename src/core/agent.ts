@@ -113,6 +113,7 @@ export async function createCaseFromText(
     desiredOutcome: objective.desiredOutcome,
     amountCents: objective.amountCents,
     currency: objective.currency,
+    meta: { orderRef: objective.orderRef, trackingRef: objective.trackingRef },
   });
 
   // Store the raw statement as evidence + each extracted fact as a claim with
@@ -131,7 +132,7 @@ export async function createCaseFromText(
       evidenceId: evId,
     });
   }
-  if (objective.orderRef) {
+  if (objective.orderRef && !objective.claims.some((c) => c.text.includes(objective.orderRef!))) {
     await addClaim(env.DB, caseId, {
       text: `Order reference ${objective.orderRef}`,
       status: "CUSTOMER_STATED",

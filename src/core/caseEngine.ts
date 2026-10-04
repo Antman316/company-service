@@ -70,8 +70,8 @@ export async function createCase(
   const id = newId("case");
   await run(
     db,
-    `INSERT INTO cases (id, user_id, company_id, company_name, title, issue_type, desired_outcome, amount_cents, currency, status, intake_text)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+    `INSERT INTO cases (id, user_id, company_id, company_name, title, issue_type, desired_outcome, amount_cents, currency, status, intake_text, meta)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
     id,
     userId,
     input.companyId ?? null,
@@ -83,6 +83,7 @@ export async function createCase(
     input.currency ?? "USD",
     "DRAFT",
     input.intakeText,
+    input.meta ? JSON.stringify(input.meta) : null,
   );
   await caseEvent(db, id, "case_created", "customer", { title: input.title, intakeText: input.intakeText });
   return id;

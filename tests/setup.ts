@@ -2,7 +2,7 @@ import { applyD1Migrations, env } from "cloudflare:test";
 import { beforeAll } from "vitest";
 
 declare module "cloudflare:test" {
-  interface ProvidedEnv {
+  interface ProvidedEnv extends Env {
     TEST_MIGRATIONS: D1Migration[];
   }
 }
