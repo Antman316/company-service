@@ -1,0 +1,10 @@
+node_modules/
+dist/
+web/dist/
+.wrangler/
+.dev.vars
+*.local
+.DS_Store
+coverage/
+.vite/
+tsconfig.tsbuildinfo

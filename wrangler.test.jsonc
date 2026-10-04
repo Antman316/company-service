@@ -1,0 +1,26 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "company-service-test",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "company-service-db-test",
+      "database_id": "00000000-0000-0000-0000-000000000001"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "EVIDENCE",
+      "bucket_name": "company-service-evidence-test"
+    }
+  ],
+  "vars": {
+    "ENVIRONMENT": "test",
+    "EMAIL_DOMAIN": "case.company-service.test",
+    "SIM_MERCHANT_ENABLED": "true",
+    "SECRET_KEY": "test-secret-key-for-unit-tests-only"
+  }
+}

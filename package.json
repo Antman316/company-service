@@ -1,0 +1,30 @@
+{
+  "name": "company-service",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Company Service — an AI consumer representative that deals with companies on your behalf.",
+  "scripts": {
+    "dev": "wrangler dev --port 8787",
+    "build": "vite build",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p web/tsconfig.json",
+    "test": "vitest run",
+    "migrate:local": "wrangler d1 migrations apply company-service-db --local",
+    "deploy": "npm run build && wrangler deploy"
+  },
+  "dependencies": {
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@cloudflare/vite-plugin": "^1.13.0",
+    "@cloudflare/vitest-pool-workers": "^0.8.0",
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "@vitejs/plugin-react": "^4.6.0",
+    "typescript": "^5.8.0",
+    "vite": "^6.3.0",
+    "vitest": "^3.2.0",
+    "wrangler": "^4.40.0"
+  }
+}
