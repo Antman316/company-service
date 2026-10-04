@@ -10,7 +10,8 @@ const SESSION_TTL_MS = 30 * 24 * 3600 * 1000;
 async function hashPassword(password: string, salt: string): Promise<string> {
   const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveBits"]);
   const bits = await crypto.subtle.deriveBits(
-    { name: "PBKDF2", salt: new TextEncoder().encode(`cs:${salt}`), iterations: 120_000, hash: "SHA-256" },
+    // Workers' WebCrypto caps PBKDF2 at 100k iterations.
+    { name: "PBKDF2", salt: new TextEncoder().encode(`cs:${salt}`), iterations: 100_000, hash: "SHA-256" },
     key,
     256,
   );

@@ -54,7 +54,9 @@ export async function findCompany(db: D1Database, name: string): Promise<Company
     rows.find(
       (c) =>
         c.name.toLowerCase() === norm ||
-        c.name.toLowerCase().includes(norm) ||
+        // Loose substring matching only for non-trivial names — otherwise "a"
+        // or "on" would match every company and fabricate coverage.
+        (norm.length >= 3 && c.name.toLowerCase().includes(norm)) ||
         norm.includes(c.name.toLowerCase()),
     ) ?? null
   );

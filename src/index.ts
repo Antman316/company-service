@@ -18,6 +18,7 @@ import { seedRegistry } from "./adapters/registry";
 import { resolveInboundCase, parseInbound } from "./email/threading";
 import { encryptJson } from "./security/crypto";
 import { getSession, requireCsrf, signin, signout, signup } from "./http/auth";
+import { STATIC_FILES } from "./static";
 
 // --------------------------------------------------------------------------
 // Tiny JSON router — /api/* is the product API; everything else falls through
@@ -401,8 +402,24 @@ export default {
         const session = await getSession(req, env.DB);
         return await api(req, { env, url, session });
       }
-      // SPA assets (Assets binding handles not_found -> index.html).
-      return env.ASSETS ? env.ASSETS.fetch(req) : new Response("Company Service", { status: 200 });
+      // SPA: prefer the ASSETS binding when present; otherwise serve the
+      // inlined build (scripts/gen-static.mjs) — used when the assets upload
+      // API isn't reachable from the deploy path.
+      if (env.ASSETS) return env.ASSETS.fetch(req);
+      const asset = STATIC_FILES[url.pathname];
+      if (asset) {
+        const bytes = Uint8Array.from(atob(asset.body), (ch) => ch.charCodeAt(0));
+        return new Response(bytes, {
+          headers: { "content-type": asset.type, "cache-control": url.pathname === "/index.html" ? "no-store" : "public, max-age=31536000, immutable" },
+        });
+      }
+      const index = STATIC_FILES["/index.html"];
+      if (index) {
+        return new Response(Uint8Array.from(atob(index.body), (ch) => ch.charCodeAt(0)), {
+          headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" },
+        });
+      }
+      return new Response("Company Service", { status: 200 });
     } catch (e) {
       console.error("unhandled", e);
       return err(500, "internal error");
