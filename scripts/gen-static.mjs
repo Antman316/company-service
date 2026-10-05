@@ -1,6 +1,7 @@
 // Generates src/static.ts — the built SPA inlined as base64 so the Worker can
 // serve it without an ASSETS binding (deployed environments where the assets
-// upload API isn't reachable).
+// upload API isn't reachable). Overwrites the committed stub; the generated
+// output is for the deploy bundle only and should not be committed.
 import { readdirSync, readFileSync, writeFileSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 

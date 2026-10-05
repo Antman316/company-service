@@ -9,8 +9,6 @@ coverage/
 .vite/
 tsconfig.tsbuildinfo
 
-# generated SPA bundle
-src/static.ts
 
 # build artifacts
 dist-worker/
