@@ -213,7 +213,7 @@ export async function seedRegistry(db: D1Database): Promise<void> {
         "customer's own authenticated session",
         "ASSISTED",
         "Customer sends the drafted message in their own logged-in browser session; Company Service never sees merchant credentials.",
-        "UNVERIFIED",
+        "ASSISTED",
         "assisted-lane@1.0.0",
         "unknown",
         "Assisted lane — human-in-loop delivery.",
