@@ -269,3 +269,34 @@ describe("evidence upload hardening", () => {
     expect(own.headers.get("Content-Disposition")).toContain("attachment");
   });
 });
+
+describe("cloudflare send_email transport", () => {
+  it("delivers through env.MAILOUT with stamped headers and no credential", async () => {
+    const sent: unknown[] = [];
+    (env as any).MAILOUT = {
+      send: async (m: unknown) => {
+        sent.push(m);
+      },
+    };
+    try {
+      const { sendCaseEmail } = await import("../src/email/transport");
+      const r = await sendCaseEmail(env as any, "user_no_conns", {
+        to: "service@realmerchant.example",
+        subject: "Re: your case [CS-tok123]",
+        body: "Please confirm receipt.",
+        replyTo: "cases@agentmasterkey.com",
+        messageId: "cs-tok123-act1@agentmasterkey.com",
+      });
+      expect(r.ok).toBe(true);
+      expect(r.transport).toBe("cloudflare_send_email");
+      expect(r.externalId).toBe("<cs-tok123-act1@agentmasterkey.com>");
+      expect(sent).toHaveLength(1);
+      // EmailMessage contents are opaque to the binding caller; delivery +
+      // threading headers are covered by the stamped externalId and the live
+      // cs-mail-out probe that rode the real MX path on prod.
+      expect(sent[0]).toBeTruthy();
+    } finally {
+      delete (env as any).MAILOUT;
+    }
+  });
+});

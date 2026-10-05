@@ -23,6 +23,11 @@
       "bucket_name": "company-service-evidence"
     }
   ],
+  "send_email": [
+    {
+      "name": "MAILOUT"
+    }
+  ],
   "triggers": {
     "crons": ["*/5 * * * *"]
   },

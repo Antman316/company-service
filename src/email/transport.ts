@@ -6,8 +6,10 @@ import { TEST_MERCHANT_EMAIL } from "../adapters/testMerchant";
 // Outbound email transports — chosen in strict order:
 //   1. test-merchant domain  -> internal simulation (DEMO, no mail leaves)
 //   2. active gmail connection (customer BYO OAuth, send-only gmail.send scope)
-//   3. Resend send-only API key (env.RESEND_API_KEY) -> real delivery
-//   4. dev_log (records intent, marks simulated — no real mail)
+//   3. Cloudflare send_email binding (env.MAILOUT) -> real delivery, no
+//      external credential — Email Routing's native outbound on the zone
+//   4. Resend send-only API key (env.RESEND_API_KEY / connection) -> real delivery
+//   5. dev_log (records intent, marks simulated — no real mail)
 // The customer's Gmail is only ever used to SEND — we never read their inbox.
 // Inbound replies land on env.INBOUND_ADDRESS via Cloudflare Email Routing.
 // ---------------------------------------------------------------------------
@@ -99,6 +101,38 @@ async function resendSend(cfg: ResendCfg, msg: OutboundEmail): Promise<SendResul
   }
 }
 
+// Cloudflare-native transport: the Email Routing `send_email` binding on the
+// same zone. Zero external credentials — sends through the zone's real SMTP
+// path with managed DKIM/SPF. Minimal permission by construction.
+async function cloudflareSend(env: Env, msg: OutboundEmail): Promise<SendResult> {
+  if (!env.MAILOUT) {
+    return { ok: false, transport: "cloudflare_send_email", error: "MAILOUT binding not configured" };
+  }
+  const fromAddr = env.INBOUND_ADDRESS ?? "cases@agentmasterkey.com";
+  const raw = [
+    `From: ${env.EMAIL_FROM ?? `Company Service <${fromAddr}>`}`,
+    `To: ${msg.to}`,
+    `Subject: ${msg.subject}`,
+    msg.replyTo ? `Reply-To: ${msg.replyTo}` : "",
+    msg.messageId ? `Message-ID: <${msg.messageId}>` : "",
+    `MIME-Version: 1.0`,
+    `Content-Type: text/plain; charset=utf-8`,
+    ``,
+    msg.body,
+  ].filter(Boolean).join("\r\n");
+  try {
+    const { EmailMessage } = await import("cloudflare:email");
+    await env.MAILOUT.send(new EmailMessage(fromAddr, msg.to, raw));
+    return {
+      ok: true,
+      transport: "cloudflare_send_email",
+      externalId: msg.messageId ? `<${msg.messageId}>` : undefined,
+    };
+  } catch (e) {
+    return { ok: false, transport: "cloudflare_send_email", error: String(e) };
+  }
+}
+
 // Route an outbound case email through the right transport.
 export async function sendCaseEmail(
   env: Env,
@@ -118,6 +152,10 @@ export async function sendCaseEmail(
   if (conn?.config_enc && env.SECRET_KEY) {
     const cfg = await decryptJson<GmailCfg>(conn.config_enc, env.SECRET_KEY);
     return gmailSend(cfg, msg);
+  }
+
+  if (env.MAILOUT) {
+    return cloudflareSend(env, msg);
   }
 
   const resConn = await q1<{ config_enc: string | null }>(
@@ -155,10 +193,12 @@ export async function emailCapability(env: Env, userId: string) {
   return {
     outbound: conn
       ? `${conn.provider} via customer connection (send-only scope)`
-      : env.RESEND_API_KEY
-        ? `resend send-only key (${env.EMAIL_FROM ?? "cases@agentmasterkey.com"})`
-        : "dev_log (no live delivery)",
+      : env.MAILOUT
+        ? `cloudflare send_email (${env.EMAIL_FROM ?? "cases@agentmasterkey.com"})`
+        : env.RESEND_API_KEY
+          ? `resend send-only key (${env.EMAIL_FROM ?? "cases@agentmasterkey.com"})`
+          : "dev_log (no live delivery)",
     inbound,
-    configured: !!conn || !!env.RESEND_API_KEY,
+    configured: !!conn || !!env.MAILOUT || !!env.RESEND_API_KEY,
   };
 }

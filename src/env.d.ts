@@ -9,4 +9,17 @@ interface Env {
   INBOUND_ADDRESS?: string;
   /** Outbound From header, e.g. "Company Service <cases@agentmasterkey.com>". */
   EMAIL_FROM?: string;
+  /** Cloudflare Email Routing send_email binding — native outbound lane. */
+  MAILOUT?: SendEmailBinding;
+}
+
+// Minimal local declaration — full types live in the runtime.
+declare module "cloudflare:email" {
+  export class EmailMessage {
+    constructor(from: string, to: string, raw: string | ReadableStream | ArrayBuffer);
+  }
+}
+
+interface SendEmailBinding {
+  send(message: unknown): Promise<void>;
 }
