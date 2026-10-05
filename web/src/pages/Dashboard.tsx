@@ -55,7 +55,39 @@ export function Dashboard({ nav, me }: { nav: (to: string) => void; me: { email:
           )}
         </>
       )}
+
+      <div className="card" style={{ marginTop: 28 }}>
+        <div className="section-title" style={{ marginTop: 0 }}>Your data</div>
+        <p className="small muted">
+          Everything Company Service holds about you — cases, evidence, messages, connections.
+        </p>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <a className="btn btn-sm" href="/api/account/export" target="_blank" rel="noreferrer">Export my data</a>
+          <DeleteAccount />
+        </div>
+      </div>
     </div>
+  );
+}
+
+function DeleteAccount() {
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  if (!confirming) {
+    return <button className="btn btn-sm btn-ghost" onClick={() => setConfirming(true)}>Delete my account</button>;
+  }
+  return (
+    <span style={{ display: "inline-flex", gap: 8, alignItems: "center" }}>
+      <span className="small" style={{ color: "var(--red)" }}>Deletes cases, evidence, messages, connections — cannot be undone.</span>
+      <button className="btn btn-sm btn-danger" disabled={busy} onClick={async () => {
+        setBusy(true);
+        try { await api.deleteAccount(); window.location.href = "#/"; window.location.reload(); }
+        catch (e: any) { setErr(e.message); setBusy(false); }
+      }}>Confirm delete</button>
+      <button className="btn btn-sm btn-ghost" onClick={() => setConfirming(false)}>Keep account</button>
+      {err && <span className="small" style={{ color: "var(--red)" }}>{err}</span>}
+    </span>
   );
 }
 

@@ -53,6 +53,7 @@ export const CASE_TRANSITIONS: Record<CaseState, CaseState[]> = {
   ],
   WAITING_FOR_CUSTOMER: [
     "IN_PROGRESS",
+    "WAITING_FOR_COMPANY",
     "NEEDS_INFORMATION",
     "AWAITING_AUTHORIZATION",
     "RESOLUTION_PROPOSED",
@@ -206,6 +207,8 @@ export interface CoverageResult {
   verificationStatus: VerificationStatus;
   adapterId?: string;
   channel?: string;
+  /** Concrete destination for this channel (support email, chat/portal URL). */
+  channelAddress?: string;
   limitations?: string;
   reason: string;
 }

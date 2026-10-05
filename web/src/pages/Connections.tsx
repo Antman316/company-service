@@ -61,7 +61,7 @@ export function Connections() {
               </span>
               <span className={`chip chip-${c.status === "active" ? "green" : c.status === "error" ? "red" : ""}`}>{c.status}</span>
               <button className="btn btn-sm" onClick={() => test(c.id)}>Test</button>
-              <button className="btn btn-sm btn-ghost" onClick={async () => { await api.removeConnection(c.id); load(); }}>Remove</button>
+              <button className="btn btn-sm btn-ghost" onClick={async () => { await api.removeConnection(c.id); load(); }}>Revoke</button>
             </div>
           ))}
         </div>
@@ -85,7 +85,8 @@ export function Connections() {
           {msg && <div className="notice" style={{ marginBottom: 10 }}>{msg}</div>}
           <button className="btn btn-primary" onClick={add}>Save connection</button>
           <p className="small muted" style={{ marginTop: 10 }}>
-            Email connections (Gmail send-only) land in a later version — inbound email uses your case address in V1.
+            Inbound case mail is live at <strong>cases@agentmasterkey.com</strong> via Cloudflare Email Routing —
+            replies thread to your case automatically. Gmail send-only OAuth lands in V1.1.
           </p>
         </div>
       </div>

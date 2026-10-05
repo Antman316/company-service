@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Company Service \u2014 an AI consumer representative that deals with companies on your behalf.",
+  "description": "Company Service — an AI consumer representative that deals with companies on your behalf.",
   "scripts": {
     "dev": "wrangler dev --port 8787",
     "build": "vite build",
@@ -14,6 +14,7 @@
     "gen:static": "node scripts/gen-static.mjs"
   },
   "dependencies": {
+    "postal-mime": "^4.0.4",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
   },

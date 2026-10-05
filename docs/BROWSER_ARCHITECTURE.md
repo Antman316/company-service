@@ -1,6 +1,14 @@
 # Browser Architecture
 
-**Status: DESIGNED — NOT IMPLEMENTED in V1.**
+**Status: ASSISTED lane IMPLEMENTED + VERIFIED on prod; autonomous browser
+DESIGNED — NOT BUILT.**
+
+The V1 browser/chat story is the assisted lane: for `chat`-channel coverage
+rows (Amazon/Walmart/Target), the agent drafts the message, the customer
+carries it in their own logged-in browser session, marks it sent, and pastes
+the merchant's reply back into the case for ingestion. No merchant
+credentials touch Company Service — honest human-in-the-loop, not simulated
+autonomy. Verified end-to-end on production.
 
 ## Decision (recorded for V1.1)
 

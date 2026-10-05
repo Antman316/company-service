@@ -12,6 +12,8 @@ export function CaseDetail({ id, nav }: { id: string; nav: (to: string) => void 
   const [tab, setTab] = useState<"timeline" | "messages" | "evidence">("timeline");
   const [note, setNote] = useState("");
   const [evText, setEvText] = useState("");
+  const [replyText, setReplyText] = useState("");
+  const [copied, setCopied] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
 
   const load = useCallback(() => {
@@ -21,7 +23,7 @@ export function CaseDetail({ id, nav }: { id: string; nav: (to: string) => void 
 
   async function act(name: string, fn: () => Promise<any>) {
     setBusy(name);
-    try { await fn(); load(); } catch (e: any) { setErr(e.message); } finally { setBusy(null); }
+    try { setErr(null); await fn(); load(); } catch (e: any) { setErr(e.message); } finally { setBusy(null); }
   }
 
   async function decide(approvalId: string, optionId: string) {
@@ -32,8 +34,9 @@ export function CaseDetail({ id, nav }: { id: string; nav: (to: string) => void 
     await act("upload", () => api.uploadEvidence(id, file));
   }
 
-  if (err) return <div className="page"><div className="error-box">{err}</div></div>;
-  if (!d) return <div className="page"><span className="spinner" /></div>;
+  if (!d) {
+    return <div className="page">{err ? <div className="error-box">{err}</div> : <span className="spinner" />}</div>;
+  }
 
   const c = d.case;
   const pendingApprovals = (d.approvals ?? []).filter((a: any) => a.status === "pending");
@@ -43,6 +46,7 @@ export function CaseDetail({ id, nav }: { id: string; nav: (to: string) => void 
   return (
     <div className="page">
       <a href="#/app" className="small muted">← All cases</a>
+      {err && <div className="error-box" style={{ marginTop: 10 }}>{err}</div>}
       <div style={{ display: "flex", alignItems: "flex-start", gap: 14, marginTop: 8, flexWrap: "wrap" }}>
         <div style={{ flex: 1, minWidth: 240 }}>
           <h1 style={{ margin: 0, letterSpacing: "-.02em", fontSize: 26 }}>{c.title}</h1>
@@ -86,6 +90,49 @@ export function CaseDetail({ id, nav }: { id: string; nav: (to: string) => void 
       {nextFollowUp && open && (
         <div className="notice" style={{ marginTop: 16 }}>
           Next scheduled follow-up: <strong>{nextFollowUp.kind.replace(/_/g, " ")}</strong> — due {fmtTime(nextFollowUp.dueAt)}
+        </div>
+      )}
+
+      {(d.assisted || d.assistedLane) && open && (
+        <div className="card" style={{ marginTop: 16, borderColor: "var(--amber)" }}>
+          <div className="section-title" style={{ marginTop: 0 }}>Assisted step — carried by you</div>
+          {d.assisted ? (
+            <>
+              <p className="small muted">
+                This company's support channel can't be automated safely. Send the drafted message yourself at{" "}
+                <strong>{d.assisted.target}</strong> — your own browser, your own login. Then paste their reply below.
+              </p>
+              <div className="msg msg-out" style={{ marginBottom: 10 }}>
+                <div className="dir">Drafted by your agent</div>
+                <div className="body" style={{ whiteSpace: "pre-wrap" }}>{d.assisted.draft}</div>
+              </div>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 12 }}>
+                <button className="btn btn-sm" onClick={async () => {
+                  try { await navigator.clipboard.writeText(d.assisted.draft); setCopied(true); setTimeout(() => setCopied(false), 1500); } catch {}
+                }}>{copied ? "Copied" : "Copy message"}</button>
+                {d.assisted.target?.startsWith("http") && (
+                  <a className="btn btn-sm" href={d.assisted.target} target="_blank" rel="noreferrer">Open their support page</a>
+                )}
+                <button className="btn btn-sm btn-primary" disabled={busy === "asent"} onClick={() => act("asent", () => api.assistedSent(id))}>
+                  I sent it
+                </button>
+              </div>
+            </>
+          ) : (
+            <p className="small muted">
+              You sent the drafted message through the merchant's own channel. When they reply — often hours or
+              days later — paste it here and your agent picks the case back up.
+            </p>
+          )}
+          <div className="field" style={{ marginBottom: 8 }}>
+            <label>Paste their reply here</label>
+            <textarea className="textarea" style={{ minHeight: 70 }} value={replyText} onChange={(e) => setReplyText(e.target.value)}
+              placeholder="The company wrote back: …" />
+          </div>
+          <button className="btn btn-sm" disabled={!replyText.trim() || busy === "areply"}
+            onClick={() => act("areply", async () => { await api.assistedReply(id, replyText.trim()); setReplyText(""); })}>
+            Submit reply
+          </button>
         </div>
       )}
 

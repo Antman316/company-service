@@ -42,7 +42,10 @@ export const api = {
       method: "POST", body: form, credentials: "same-origin",
       headers: csrfToken ? { "x-csrf": csrfToken } : {},
     });
-    if (!r.ok) throw new ApiError(r.status, "upload failed");
+    if (!r.ok) {
+      const body = await r.json().catch(() => ({}));
+      throw new ApiError(r.status, (body as any)?.error ?? `upload failed (HTTP ${r.status})`);
+    }
     return r.json();
   },
   grantMandate: (id: string, m: { authorized: string[]; approvalRequired: string[]; prohibited?: string[]; expiresAt?: string }) =>
@@ -66,6 +69,12 @@ export const api = {
 
   coverage: () => req<{ companies: any[]; coverage: any[] }>("/api/coverage"),
   economics: () => req<any>("/api/economics"),
+
+  assistedSent: (id: string) => req(`/api/cases/${id}/assisted/sent`, { method: "POST" }),
+  assistedReply: (id: string, body: string) =>
+    req(`/api/cases/${id}/assisted/reply`, { method: "POST", body: JSON.stringify({ body }) }),
+
+  deleteAccount: () => req(`/api/account/delete`, { method: "POST", body: JSON.stringify({ confirm: "DELETE" }) }),
 };
 
 export function money(cents: number | null | undefined, currency = "USD"): string {
@@ -112,6 +121,9 @@ export const EVENT_LABELS: Record<string, string> = {
   transition_skipped: "State note",
   injection_blocked: "Injection attempt blocked",
   manual_handoff: "Manual handoff",
+  assisted_step_ready: "Your turn — assisted step ready",
+  assisted_sent: "You sent the assisted message",
+  attachment_skipped: "Attachment skipped (limit)",
   customer_note: "You added a note",
   case_paused: "Case paused",
   case_resumed: "Case resumed",
