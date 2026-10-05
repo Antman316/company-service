@@ -73,6 +73,10 @@ reply interpretation, deflection classification) runs on a real model.
   fall back to a safe deterministic step (never send unvalidated text).
 - Cost: every call writes `cost_events` with real tokens and `micro_usd`;
   per-case soft cap (default $0.50) → pause + approval to continue.
+- Abuse/cost gate: no platform-key model call before the account email is
+  verified; per-user daily and global daily spend caps (hard stop + alert);
+  Turnstile on signup. Unverified accounts may only use `local_dev`-style
+  deterministic intake.
 - `local_dev` stays the test provider; CI-free test suite keeps using it.
 
 **Acceptance:** a prod case on a real merchant is planned and drafted by the
@@ -99,7 +103,11 @@ live provider; `/economics` shows non-zero real cost; injection tests
 
 ### 2.2 Forward-to-start intake
 - Customer forwards an order/shipping/refund email to `cases@` (no token)
-  from their **verified account email** → new DRAFT case for that user.
+  from their **verified account email** → new DRAFT case for that user,
+  **only if** the Email Routing authentication results show SPF or DKIM
+  pass with DMARC alignment for the sender domain. Otherwise no case is
+  created; a confirm-by-link email goes to the account address and the case
+  opens only after the account holder clicks it (signed in).
 - Parse with `postal-mime` + `light` model: merchant, order number, items,
   amounts, dates, tracking → `case_claims` as `DOCUMENT_VERIFIED` (the
   original forwarded message is stored as `email` evidence with SHA-256).
@@ -319,8 +327,11 @@ reason) and applied via d10a D1 query, then `seedRegistry` per-row upserts.
 `POST /api/cases/:id/received` (money check-in),
 `GET /api/cases/:id/bundle.pdf`, `GET /api/results`,
 `POST /api/billing/{checkout,webhook}`, `GET/PUT /api/notifications`.
-All behind existing session + CSRF + tenant checks; companion uses its
-pairing token.
+All behind existing session + CSRF + tenant checks, except: companion
+endpoints use the pairing token, and `POST /api/billing/webhook` is
+session/CSRF-exempt and authenticated only by Stripe signature verification
+(`Stripe-Signature`, raw body, timestamp tolerance, idempotent on event id);
+the OAuth `callback` is session-bound via a signed `state` parameter.
 
 ## 5. UI changes
 
