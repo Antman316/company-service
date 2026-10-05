@@ -93,28 +93,37 @@ export function CaseDetail({ id, nav }: { id: string; nav: (to: string) => void 
         </div>
       )}
 
-      {d.assisted && open && (
+      {(d.assisted || d.assistedLane) && open && (
         <div className="card" style={{ marginTop: 16, borderColor: "var(--amber)" }}>
-          <div className="section-title" style={{ marginTop: 0 }}>Your turn — assisted step</div>
-          <p className="small muted">
-            This company's support channel can't be automated safely. Send the drafted message yourself at{" "}
-            <strong>{d.assisted.target}</strong> — your own browser, your own login. Then paste their reply below.
-          </p>
-          <div className="msg msg-out" style={{ marginBottom: 10 }}>
-            <div className="dir">Drafted by your agent</div>
-            <div className="body" style={{ whiteSpace: "pre-wrap" }}>{d.assisted.draft}</div>
-          </div>
-          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 12 }}>
-            <button className="btn btn-sm" onClick={async () => {
-              try { await navigator.clipboard.writeText(d.assisted.draft); setCopied(true); setTimeout(() => setCopied(false), 1500); } catch {}
-            }}>{copied ? "Copied" : "Copy message"}</button>
-            {d.assisted.target?.startsWith("http") && (
-              <a className="btn btn-sm" href={d.assisted.target} target="_blank" rel="noreferrer">Open their support page</a>
-            )}
-            <button className="btn btn-sm btn-primary" disabled={busy === "asent"} onClick={() => act("asent", () => api.assistedSent(id))}>
-              I sent it
-            </button>
-          </div>
+          <div className="section-title" style={{ marginTop: 0 }}>Assisted step — carried by you</div>
+          {d.assisted ? (
+            <>
+              <p className="small muted">
+                This company's support channel can't be automated safely. Send the drafted message yourself at{" "}
+                <strong>{d.assisted.target}</strong> — your own browser, your own login. Then paste their reply below.
+              </p>
+              <div className="msg msg-out" style={{ marginBottom: 10 }}>
+                <div className="dir">Drafted by your agent</div>
+                <div className="body" style={{ whiteSpace: "pre-wrap" }}>{d.assisted.draft}</div>
+              </div>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 12 }}>
+                <button className="btn btn-sm" onClick={async () => {
+                  try { await navigator.clipboard.writeText(d.assisted.draft); setCopied(true); setTimeout(() => setCopied(false), 1500); } catch {}
+                }}>{copied ? "Copied" : "Copy message"}</button>
+                {d.assisted.target?.startsWith("http") && (
+                  <a className="btn btn-sm" href={d.assisted.target} target="_blank" rel="noreferrer">Open their support page</a>
+                )}
+                <button className="btn btn-sm btn-primary" disabled={busy === "asent"} onClick={() => act("asent", () => api.assistedSent(id))}>
+                  I sent it
+                </button>
+              </div>
+            </>
+          ) : (
+            <p className="small muted">
+              You sent the drafted message through the merchant's own channel. When they reply — often hours or
+              days later — paste it here and your agent picks the case back up.
+            </p>
+          )}
           <div className="field" style={{ marginBottom: 8 }}>
             <label>Paste their reply here</label>
             <textarea className="textarea" style={{ minHeight: 70 }} value={replyText} onChange={(e) => setReplyText(e.target.value)}

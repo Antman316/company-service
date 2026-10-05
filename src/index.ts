@@ -436,22 +436,34 @@ async function caseDetail(env: Env, caseId: string) {
       id: r.id, kind: r.kind, dueAt: r.due_at, status: r.status, firedAt: r.fired_at,
     })),
     costs,
-    assisted: await assistedStep(env.DB, caseId),
+    ...(await assistedLane(env.DB, caseId)),
   };
 }
 
-// The pending assisted-lane step for this case, if any: the drafted message
-// the customer needs to carry into the merchant's own support channel.
-async function assistedStep(db: D1Database, caseId: string) {
+// Assisted-lane state for the UI: `assisted` is the pending drafted step (if
+// any); `assistedLane` stays true once the case has run an assisted send so the
+// reply box survives the "I sent it" transition — merchant replies arrive late.
+async function assistedLane(db: D1Database, caseId: string) {
   const row = await q1<{ id: string; result_json: string | null; created_at: string }>(
     db,
     `SELECT id, result_json, created_at FROM case_actions WHERE case_id = ? AND status = 'awaiting_customer' ORDER BY created_at DESC LIMIT 1`,
     caseId,
   );
-  if (!row) return null;
-  const r = json<{ draft?: string; target?: string | null }>(row.result_json, {});
-  return { actionId: row.id, draft: r.draft ?? "", target: r.target ?? "the merchant's support page", createdAt: row.created_at };
+  const assisted = row
+    ? (() => {
+        const r = json<{ draft?: string; target?: string | null }>(row.result_json, {});
+        return { actionId: row.id, draft: r.draft ?? "", target: r.target ?? "the merchant's support page", createdAt: row.created_at };
+      })()
+    : null;
+  const laneOpen = assisted !== null || (await q1<{ id: string }>(
+    db,
+    `SELECT m.id FROM external_messages m JOIN external_conversations c ON c.id = m.conversation_id
+     WHERE c.case_id = ? AND m.meta_json LIKE '%"assisted"%' LIMIT 1`,
+    caseId,
+  )) !== null;
+  return { assisted, assistedLane: laneOpen };
 }
+
 
 // Evidence upload guardrails: generous but bounded, and never executable.
 const MAX_EVIDENCE_BYTES = 10 * 1024 * 1024;
