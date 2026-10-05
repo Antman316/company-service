@@ -221,4 +221,31 @@ export async function seedRegistry(db: D1Database): Promise<void> {
       )
       .run();
   }
+
+  // Chewy: real email lane. Official support email is published by Chewy's own
+  // help content (service@chewy.com). First verified workflow: general inquiry
+  // over email — outbound via Cloudflare send_email, replies ingested via
+  // Email Routing into the case. Account/order-specific actions still need
+  // the customer's own Chewy account context -> those remain MANUAL.
+  await db
+    .prepare(`INSERT OR IGNORE INTO companies (id, name, domains, adapter_id, notes) VALUES (?,?,?,?,?)`)
+    .bind("cmp_chewy", "Chewy", JSON.stringify(["chewy.com"]), null,
+      "Email support lane live-verified (send + reply ingest). Order-specific actions require customer's own account.")
+    .run();
+  await cov
+    .bind(
+      "cov_chewy_email",
+      "cmp_chewy",
+      "any",
+      "email",
+      "none — public support email; account-specific actions escalate to MANUAL",
+      "AUTOMATED",
+      "Verified only for initiating contact and ingesting replies (auto-acknowledgements). No order-data access; outcome not guaranteed; merchant may require account verification for order-specific changes.",
+      "UNVERIFIED",
+      null,
+      "unknown",
+      "Official support email published by Chewy help content.",
+      "service@chewy.com",
+    )
+    .run();
 }
