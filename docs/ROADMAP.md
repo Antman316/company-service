@@ -1,5 +1,8 @@
 # Roadmap
 
+> The ship plan from today to V1 shipped (email + chat) lives in
+> [V1_SHIP_SPEC.md](V1_SHIP_SPEC.md); it supersedes the ordering below.
+
 ## V1.1 — "one real workflow" (priority order)
 
 1. **Real inbound email** — Cloudflare Email Routing on a real case domain →
