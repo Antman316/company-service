@@ -6,19 +6,23 @@ Minimum-permission email: send on the customer's behalf without reading their
 whole inbox. Two real lanes ship in V1:
 
 - **Inbound:** Cloudflare Email Routing → the worker's `email()` handler.
-- **Outbound:** Resend API (send-only — no inbox access exists anywhere),
-  or `gmail.send` on a customer-OAuth'd connection as an alternative.
+- **Outbound:** Cloudflare `send_email` binding (`MAILOUT`) — Email
+  Routing's own managed SMTP path. No external credentials, no inbox
+  access, managed DKIM/SPF on the same zone. `gmail.send` on a
+  customer-OAuth'd connection takes precedence when connected; Resend
+  remains an optional fallback transport.
 
 ## Implemented
 
 | Piece | Status | Detail |
 |---|---|---|
-| `EmailTransport` interface | IMPLEMENTED | `send(msg)` → `{ok, messageId?}`; `pickTransport` chooses sim → gmail conn → resend conn → `env.RESEND_API_KEY` → dev_log |
+| `EmailTransport` interface | IMPLEMENTED | `send(msg)` → `{ok, messageId?}`; precedence: sim → gmail conn → `env.MAILOUT` (send_email) → resend conn → `env.RESEND_API_KEY` → dev_log |
+| `cloudflare_send_email` transport | VERIFIED on prod | `EmailMessage` from `cloudflare:email` → `MAILOUT.send` — real mail through Cloudflare's managed SMTP. Prod proof: case outbound row `msg_muunvhw9zl8s2cc8re` → `service@chewy.com`, `external_id` = stamped `cs-<token>-<action>@agentmasterkey.com` |
 | `sim` transport | VERIFIED | Test Merchant's inbound/outbound loop |
-| `resend` transport | IMPLEMENTED — NOT LIVE-VERIFIED | `POST api.resend.com/emails`; stamps `Message-ID: <case-token@domain>` + `Reply-To: case+token@INBOUND_ADDRESS`; awaiting `RESEND_API_KEY` |
-| `gmail.send` transport | IMPLEMENTED — NOT LIVE-VERIFIED | `POST gmail/v1/users/me/messages/send`, `gmail.send`-scoped token on an `email` connection |
+| `resend` transport | IMPLEMENTED — NOT LIVE-VERIFIED | `POST api.resend.com/emails`; optional fallback when `RESEND_API_KEY`/connection is configured |
+| `gmail.send` transport | IMPLEMENTED — NOT LIVE-VERIFIED | `POST gmail/v1/users/me/messages/send`, `gmail.send`-scoped token on an `email` connection; wins over MAILOUT when connected (it's the customer's own mailbox) |
 | `dev_log` transport | IMPLEMENTED | audit-only fallback (writes the would-be send to events) |
-| Email Routing inbound | IMPLEMENTED — ROUTE LIVE, RECEIPT PROOF PENDING | Literal rule `cases@agentmasterkey.com` → worker `email()`; PostalMime parses the real RFC822 stream |
+| Email Routing inbound | VERIFIED on prod | Literal rule `cases@agentmasterkey.com` → worker `email()`; real MX-transit message ingested 2026-10-05 (external msg `msg_muuniaf50l9j29c0p2`, CF-rewritten Message-ID, `receivedVia=cloudflare_email_routing`) |
 | Case resolution | IMPLEMENTED | `resolveInboundCase`: `case+token@` to-address → `[CS-token]` subject tag → `In-Reply-To`/`References` `external_id` → conversation → case; unmatched → audit `inbound_rejected` + `setReject` |
 | Dedup | VERIFIED | `external_messages.external_id` unique per `Message-ID` — same mail never processes twice (test + prod handler both covered) |
 | Inbound domain guard | IMPLEMENTED | non-`INBOUND_ADDRESS` domains rejected before parsing (`inbound_wrong_domain` audit) |

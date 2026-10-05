@@ -5,27 +5,28 @@ elsewhere as built.
 
 ## Merchant coverage
 
-- **No real merchant adapter is VERIFIED end-to-end.** Test Merchant is
-  SIMULATED; Amazon/Walmart/Target **chat** is ASSISTED (agent drafts, the
-  customer carries it in their own logged-in session, replies are pasted
-  back — lane VERIFIED on prod, merchant contact itself not proven);
-  Amazon email/portal remains UNVERIFIED. Everything else → `UNSUPPORTED`
-  + manual handoff.
+- **First real merchant lane: Chewy + US + email** — `service@chewy.com`
+  (official published support email). VERIFIED for initiating contact:
+  real outbound mail sent through `cloudflare_send_email` (prod case
+  `case_muunvdukh1f5pmklq3`, 2026-10-05). Replies ingest through the
+  live Email Routing lane (inbound verified separately). Does NOT imply
+  account access, order data, or guaranteed outcomes — those stay
+  MANUAL. Everything else → `UNSUPPORTED` + manual handoff.
+- Test Merchant remains SIMULATED; Amazon/Walmart/Target **chat** is
+  ASSISTED (lane VERIFIED on prod; merchant contact itself not proven);
+  Amazon email/portal remains UNVERIFIED.
 - No autonomous browser/chat automation — ASSISTED is the shipped lane
   (see BROWSER_ARCHITECTURE). No CAPTCHA bypass, no credential storage.
 
 ## Email
 
-- **Inbound route is live** (Cloudflare Email Routing literal rule
-  `cases@agentmasterkey.com` → `email()` handler → case-token/subject-tag
-  resolution → message-id dedup → attachment allowlist → UNTRUSTED ingest).
-  Live public-route receipt proof is **pending `RESEND_API_KEY`** — the dev
-  VM's outbound port 25 is blocked, so a real mail could not yet be sent
-  through the public MX path. All handler logic is covered by tests +
-  exercised end-to-end via PostalMime parses of real RFC822 messages.
-- Outbound Resend transport IMPLEMENTED, NOT LIVE-VERIFIED (same blocker;
-  send-only scope — no inbox access anywhere). `gmail.send` remains an
-  alternative adapter for customer-OAuth'd sends.
+- **Inbound route VERIFIED on prod** (real MX-transit message → Email
+  Routing `cases@` literal rule → `email()` handler → case-token/subject-tag
+  resolution → dedup → UNTRUSTED ingest → case wake — 2026-10-05).
+- **Outbound VERIFIED on prod via `send_email` binding** — real mail to
+  `service@chewy.com`, transport `cloudflare_send_email`, stamped Message-ID
+  threaded for replies. Resend transport stays IMPLEMENTED (unverified,
+  optional fallback); `gmail.send` remains the customer-OAuth alternative.
 - No outbound attachments.
 
 ## Model providers
