@@ -20,6 +20,8 @@
   "vars": {
     "ENVIRONMENT": "test",
     "EMAIL_DOMAIN": "case.company-service.test",
+    "INBOUND_ADDRESS": "cases@case.company-service.test",
+    "EMAIL_FROM": "Company Service <cases@case.company-service.test>",
     "SIM_MERCHANT_ENABLED": "true",
     "SECRET_KEY": "test-secret-key-for-unit-tests-only"
   }

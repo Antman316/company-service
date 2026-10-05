@@ -1,7 +1,7 @@
 import { checkCoverage, findCompany, getAdapter } from "../adapters/registry";
 import { TEST_MERCHANT_EMAIL } from "../adapters/testMerchant";
 import { sendCaseEmail } from "../email/transport";
-import { caseAddress, subjectTag } from "../email/threading";
+import { caseAddress, caseEmailToken, subjectTag } from "../email/threading";
 import { runModel } from "../providers/registry";
 import { extractJsonSafe } from "../providers/local";
 import { detectInjection, SYSTEM_POLICY_PREAMBLE, wrapUntrusted } from "../security/injection";
@@ -274,7 +274,10 @@ export async function advanceCase(
     }
 
     // AUTO_ALLOWED — execute through the selected adapter/channel.
-    const outcome = await executeAction(env, caseRow, action, channel);
+    const outcome = await executeAction(env, caseRow, action, channel, {
+      channelAddress: coverage.channelAddress,
+      assisted: coverage.coverage === "assisted",
+    });
     if (!outcome.continue) return { caseId, status: outcome.status ?? caseRow.status, stepsRun };
   }
 
@@ -370,6 +373,7 @@ async function executeAction(
   caseRow: CaseRow,
   action: { id: string; kind: string; payload_json: string | null },
   channel: string,
+  coverage: { channelAddress?: string; assisted: boolean },
 ): Promise<{ continue: boolean; status?: string }> {
   const db = env.DB;
   const companyId = caseRow.company_id ?? "";
@@ -377,16 +381,16 @@ async function executeAction(
   const scenario = caseScenario(caseRow);
 
   if (action.kind === "send_message" || action.kind === "send_followup" || action.kind === "request_escalation") {
-    return sendMerchantMessage(env, caseRow, action, channel, scenario, adapter ? "test-merchant" : null);
+    return sendMerchantMessage(env, caseRow, action, channel, scenario, adapter ? "test-merchant" : null, coverage);
   }
   if (action.kind === "send_email") {
-    return sendMerchantMessage(env, caseRow, action, "email", scenario, adapter ? "test-merchant" : null);
+    return sendMerchantMessage(env, caseRow, action, "email", scenario, adapter ? "test-merchant" : null, coverage);
   }
   if (action.kind === "request_refund_status" || action.kind === "check_merchant_status") {
-    return sendMerchantMessage(env, caseRow, action, channel, scenario, adapter ? "test-merchant" : null);
+    return sendMerchantMessage(env, caseRow, action, channel, scenario, adapter ? "test-merchant" : null, coverage);
   }
   if (action.kind === "share_evidence" || action.kind === "share_order_number" || action.kind === "share_tracking_number") {
-    return sendMerchantMessage(env, caseRow, action, channel, scenario, adapter ? "test-merchant" : null);
+    return sendMerchantMessage(env, caseRow, action, channel, scenario, adapter ? "test-merchant" : null, coverage);
   }
   // Gated kinds should never reach here unapproved; defense in depth.
   await run(db, `UPDATE case_actions SET status = 'skipped', error = 'unhandled kind at execution' WHERE id = ?`, action.id);
@@ -410,6 +414,7 @@ async function sendMerchantMessage(
   channel: string,
   scenario: string | null,
   adapterId: string | null,
+  coverage: { channelAddress?: string; assisted: boolean },
 ): Promise<{ continue: boolean; status?: string }> {
   const db = env.DB;
   const companyName = caseRow.company_name ?? "the company";
@@ -433,7 +438,39 @@ async function sendMerchantMessage(
   }
 
   const conv = await ensureConversation(db, caseRow.id, channel, adapterId ?? "none");
-  await recordMessage(db, conv, "out", `Regarding ${companyName} order ${subjectTag(caseRow.id)}`, body, "sent");
+  const subject = `${subjectTag(caseRow.id)} Regarding ${companyName} order`;
+
+  // ASSISTED lane: the supported channel is one we cannot automate (a merchant
+  // chat portal, an authenticated support page). The agent drafts; the
+  // customer sends it in their own browser session — zero credential sharing,
+  // zero bot evasion — and pastes the reply back. That reply re-enters this
+  // same ingest pipeline via /assisted/reply.
+  if (coverage.assisted) {
+    const msgId = await recordMessage(db, conv, "out", subject, body, "drafted", {
+      transport: "assisted",
+      channel,
+      target: coverage.channelAddress ?? "merchant support page",
+    });
+    await run(
+      db,
+      `UPDATE case_actions SET status='awaiting_customer', result_json=? WHERE id=?`,
+      JSON.stringify({ draft: body, messageId: msgId, target: coverage.channelAddress ?? null }),
+      action.id,
+    );
+    await caseEvent(db, caseRow.id, "assisted_step_ready", "agent", {
+      actionId: action.id,
+      channel,
+      target: coverage.channelAddress ?? "merchant support page",
+      draftPreview: body.slice(0, 160),
+    });
+    await transitionCase(db, caseRow.id, "WAITING_FOR_CUSTOMER", {
+      reason: "assisted step — send the drafted message in their support channel, then paste the reply",
+      actor: "agent",
+    });
+    return { continue: false, status: "WAITING_FOR_CUSTOMER" };
+  }
+
+  const outboundMsgId = await recordMessage(db, conv, "out", subject, body, "queued");
 
   const ctx: ExecutionContext = {
     caseId: caseRow.id,
@@ -458,16 +495,38 @@ async function sendMerchantMessage(
       return { continue: true };
     }
   } else if (channel === "email") {
+    const to = adapterId === "test-merchant" ? TEST_MERCHANT_EMAIL : (coverage.channelAddress ?? "");
+    if (!to) {
+      await run(db, `UPDATE case_actions SET status='failed', error='no destination address registered for email channel' WHERE id=?`, action.id);
+      await run(db, `UPDATE external_messages SET status='failed' WHERE id=?`, outboundMsgId);
+      return { continue: true };
+    }
+    // Stamp our own RFC Message-ID so the merchant's In-Reply-To threads back
+    // even when they mangle the subject tag.
+    const domain = env.EMAIL_DOMAIN ?? "agentmasterkey.com";
+    const stampedId = `cs-${caseEmailToken(caseRow.id)}-${action.id.replace(/^act_/, "").slice(0, 10)}@${domain}`;
     const sent = await sendCaseEmail(env, caseRow.user_id, {
-      to: "",
-      subject: `Regarding ${companyName} order ${subjectTag(caseRow.id)}`,
+      to,
+      subject,
       body,
-      replyTo: caseAddress(caseRow.id, env.EMAIL_DOMAIN ?? "case.company-service.example"),
+      replyTo: env.INBOUND_ADDRESS ?? caseAddress(caseRow.id, domain),
+      messageId: stampedId,
     });
+    // Record the provider outcome + the stamped id on the outbound row.
+    await run(
+      db,
+      `UPDATE external_messages SET status=?, external_id=?, meta_json=? WHERE id=?`,
+      sent.ok ? "sent" : "failed",
+      stampedId,
+      JSON.stringify({ transport: sent.transport, providerId: sent.externalId ?? null, simulated: sent.simulated ?? false, to }),
+      outboundMsgId,
+    );
     if (!sent.ok) {
       await run(db, `UPDATE case_actions SET status='failed', error=? WHERE id=?`, sent.error ?? "send failed", action.id);
       return { continue: true };
     }
+  } else {
+    await run(db, `UPDATE external_messages SET status='sent' WHERE id=?`, outboundMsgId);
   }
 
   await run(
@@ -536,7 +595,13 @@ export async function recordMessage(
   body: string,
   status: string,
   meta?: Record<string, unknown>,
+  externalId?: string | null,
 ): Promise<string> {
+  // Two dedup anchors: provider message-id (exact) and content hash (fallback).
+  if (externalId) {
+    const byId = await q1<{ id: string }>(db, `SELECT id FROM external_messages WHERE external_id = ?`, externalId);
+    if (byId) return byId.id;
+  }
   const dedup = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${conversationId}:${direction}:${body}`))
     .then((d) => Array.from(new Uint8Array(d)).map((b) => b.toString(16).padStart(2, "0")).join(""));
   const existing = await q1<{ id: string }>(db, `SELECT id FROM external_messages WHERE dedup_hash = ?`, dedup);
@@ -544,8 +609,8 @@ export async function recordMessage(
   const id = newId("msg");
   await run(
     db,
-    `INSERT INTO external_messages (id, conversation_id, direction, subject, body, meta_json, status, dedup_hash)
-     VALUES (?,?,?,?,?,?,?,?)`,
+    `INSERT INTO external_messages (id, conversation_id, direction, subject, body, meta_json, status, dedup_hash, external_id)
+     VALUES (?,?,?,?,?,?,?,?,?)`,
     id,
     conversationId,
     direction,
@@ -554,6 +619,7 @@ export async function recordMessage(
     JSON.stringify(meta ?? {}),
     status,
     dedup,
+    externalId ?? null,
   );
   return id;
 }
@@ -568,9 +634,19 @@ export async function ingestMerchantMessage(
   caseRow: CaseRow,
   conversationId: string,
   body: string,
+  opts?: { subject?: string; meta?: Record<string, unknown>; externalId?: string | null },
 ): Promise<void> {
   const db = env.DB;
-  await recordMessage(db, conversationId, "in", "", body, "received");
+  await recordMessage(
+    db,
+    conversationId,
+    "in",
+    opts?.subject ?? "",
+    body,
+    "received",
+    opts?.meta,
+    opts?.externalId,
+  );
   await addEvidence(db, env, caseRow.id, {
     kind: "merchant_reply",
     text: body,

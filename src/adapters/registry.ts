@@ -38,6 +38,7 @@ interface CoverageRow {
   adapter_version: string | null;
   health: string;
   notes: string | null;
+  channel_address: string | null;
 }
 
 interface CompanyRow {
@@ -117,6 +118,7 @@ export async function checkCoverage(
     verificationStatus: best.verification_status as CoverageResult["verificationStatus"],
     adapterId: company.adapter_id ?? undefined,
     channel: best.channel,
+    channelAddress: best.channel_address ?? undefined,
     limitations: best.limitations ?? undefined,
     reason: `${company.name} via ${best.channel} (${best.automation_level}, ${best.verification_status})`,
   };
@@ -142,8 +144,8 @@ export async function seedRegistry(db: D1Database): Promise<void> {
     .run();
 
   const cov = db.prepare(
-    `INSERT INTO company_coverage (id, company_id, issue_type, channel, auth_requirements, automation_level, limitations, verification_status, adapter_version, health, notes)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+    `INSERT INTO company_coverage (id, company_id, issue_type, channel, auth_requirements, automation_level, limitations, verification_status, adapter_version, health, notes, channel_address)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
   );
   for (const channel of ["email", "chat"]) {
     await cov
@@ -159,6 +161,7 @@ export async function seedRegistry(db: D1Database): Promise<void> {
         "test-merchant@1.0.0",
         "healthy",
         "DEMO fixture used for end-to-end verification.",
+        channel === "email" ? "support@test-merchant.demo" : "chat://test-merchant.demo",
       )
       .run();
   }
@@ -187,6 +190,34 @@ export async function seedRegistry(db: D1Database): Promise<void> {
         null,
         "unknown",
         "Manual handoff only.",
+        null,
+      )
+      .run();
+  }
+
+  // Assisted chat lanes for real retailers: the customer's own browser session
+  // carries the drafted message — no credential sharing, no bot evasion.
+  // UNVERIFIED until exercised end-to-end against the real site.
+  const assisted: { companyId: string; url: string }[] = [
+    { companyId: "cmp_amazon", url: "https://www.amazon.com/hz/contact-us" },
+    { companyId: "cmp_walmart", url: "https://www.walmart.com/help" },
+    { companyId: "cmp_target", url: "https://help.target.com/" },
+  ];
+  for (const a of assisted) {
+    await cov
+      .bind(
+        `cov_${a.companyId}_assist`,
+        a.companyId,
+        "any",
+        "chat",
+        "customer's own authenticated session",
+        "ASSISTED",
+        "Customer sends the drafted message in their own logged-in browser session; Company Service never sees merchant credentials.",
+        "UNVERIFIED",
+        "assisted-lane@1.0.0",
+        "unknown",
+        "Assisted lane — human-in-loop delivery.",
+        a.url,
       )
       .run();
   }

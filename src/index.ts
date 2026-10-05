@@ -1,6 +1,7 @@
 import {
   advanceCase,
   createCaseFromText,
+  ensureConversation,
   handleApprovalDecision,
   ingestMerchantMessage,
   runFollowUpSweep,
@@ -9,13 +10,14 @@ import {
 import { decideApproval, pendingApprovals } from "./core/approvals";
 import { getCase, transitionCase } from "./core/caseEngine";
 import { addEvidence, claimView, evidenceView, listClaims, listEvidence } from "./core/evidence";
-import { json, nowIso, q, q1, run } from "./core/db";
+import { addMs, json, nowIso, q, q1, run } from "./core/db";
 import { caseEvent, auditEvent } from "./core/events";
-import { cancelFollowUps } from "./core/followups";
+import { cancelFollowUps, scheduleFollowUp } from "./core/followups";
 import { activateMandate, createMandate, getLatestMandate, revokeMandate } from "./core/mandate";
 import { latestOutcome } from "./core/outcomes";
 import { seedRegistry } from "./adapters/registry";
-import { resolveInboundCase, parseInbound } from "./email/threading";
+import { extractMessageIds, resolveInboundCase } from "./email/threading";
+import PostalMime from "postal-mime";
 import { encryptJson } from "./security/crypto";
 import { getSession, requireCsrf, signin, signout, signup } from "./http/auth";
 import { STATIC_FILES } from "./static";
@@ -111,6 +113,10 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
         const label = (form.get("label") as string) || (file instanceof File ? file.name : null);
         const kind = (form.get("kind") as string) || "receipt";
         if (file instanceof File) {
+          if (file.size > MAX_EVIDENCE_BYTES) return err(413, `file too large (max ${MAX_EVIDENCE_BYTES / 1e6}MB)`);
+          if (!EVIDENCE_MIME_ALLOW.has(file.type)) {
+            return err(415, `unsupported file type: ${file.type || "unknown"}`);
+          }
           const id = await addEvidence(env.DB, env, caseId, {
             kind: kind as never, blob: await file.arrayBuffer(), mime: file.type, label: label ?? undefined,
           });
@@ -132,7 +138,50 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
       if (!ev?.r2_key || !env.EVIDENCE) return err(404, "file not found");
       const obj = await env.EVIDENCE.get(ev.r2_key);
       if (!obj) return err(404, "file not found in storage");
-      return new Response(obj.body, { headers: { "Content-Type": ev.mime ?? "application/octet-stream" } });
+      // Download-only + nosniff: stored customer files are never rendered
+      // inline by the site, so an uploaded HTML/SVG can't run script.
+      return new Response(obj.body, {
+        headers: {
+          "Content-Type": ev.mime ?? "application/octet-stream",
+          "Content-Disposition": "attachment",
+          "X-Content-Type-Options": "nosniff",
+          "Cache-Control": "private, no-store",
+        },
+      });
+    }
+    if (sub === "/assisted/sent" && req.method === "POST") {
+      // Customer carried the drafted message through the assisted channel.
+      const act = await q1<{ id: string }>(
+        env.DB,
+        `SELECT id FROM case_actions WHERE case_id = ? AND status = 'awaiting_customer' ORDER BY created_at DESC LIMIT 1`,
+        caseId,
+      );
+      if (!act) return err(409, "no assisted step is waiting on you");
+      await run(env.DB, `UPDATE case_actions SET status='executed', executed_at=? WHERE id=?`, nowIso(), act.id);
+      await caseEvent(env.DB, caseId, "assisted_sent", "customer", { actionId: act.id });
+      await transitionCase(env.DB, caseId, "WAITING_FOR_COMPANY", { reason: "customer sent assisted message", actor: "customer" });
+      // Wake the case if the merchant never replies.
+      await scheduleFollowUp(env.DB, caseId, "send_followup", addMs(nowIso(), 2 * 24 * 3600 * 1000), { via: "assisted" });
+      return res({ ok: true });
+    }
+    if (sub === "/assisted/reply" && req.method === "POST") {
+      const b = (await req.json()) as { body?: string };
+      if (!b.body?.trim()) return err(400, "paste the reply you received");
+      const caseRow = await getCase(env.DB, caseId);
+      if (!caseRow) return err(404, "case not found");
+      const conv = await q1<{ id: string }>(
+        env.DB,
+        `SELECT id FROM external_conversations WHERE case_id = ? ORDER BY created_at DESC LIMIT 1`,
+        caseId,
+      );
+      const convId = conv?.id ?? (await ensureConversation(env.DB, caseId, "chat", "assisted"));
+      // The pasted reply is merchant-originated: same untrusted ingest path as
+      // email — injection screened, evidence provenance, policy gating.
+      await ingestMerchantMessage(env, caseRow, convId, b.body.trim(), {
+        meta: { transport: "assisted", pastedBy: "customer" },
+      });
+      const outcome = await advanceCase(env, caseId, "assisted_reply");
+      return res({ ok: true, case: outcome });
     }
     if (sub === "/mandate" && req.method === "POST") {
       const b = (await req.json()) as {
@@ -266,10 +315,22 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
       return res({ providerId: provider.id, ...health });
     }
     if (req.method === "DELETE") {
-      await run(env.DB, `UPDATE connections SET status = 'revoked', updated_at = ? WHERE id = ?`, nowIso(), owned.id);
+      // Revocation wipes stored credentials — "revoked" is not just a flag.
+      await run(env.DB, `UPDATE connections SET status = 'revoked', config_enc = NULL, updated_at = ? WHERE id = ?`, nowIso(), owned.id);
       await auditEvent(env.DB, { userId: uid, type: "connection_revoked", data: { connectionId: owned.id } });
       return res({ ok: true });
     }
+  }
+
+  // ---- customer data control ----
+  if (path === "/api/account/export" && req.method === "GET") {
+    return res(await exportAccount(env, uid));
+  }
+  if (path === "/api/account/delete" && req.method === "POST") {
+    const b = (await req.json().catch(() => ({}))) as { confirm?: string };
+    if (b.confirm !== "DELETE") return err(400, "confirm with {\"confirm\":\"DELETE\"}");
+    await deleteAccount(env, uid, session.token);
+    return res({ ok: true }, { headers: { "Set-Cookie": `cs_session=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0` } });
   }
 
   // ---- coverage registry ----
@@ -375,10 +436,40 @@ async function caseDetail(env: Env, caseId: string) {
       id: r.id, kind: r.kind, dueAt: r.due_at, status: r.status, firedAt: r.fired_at,
     })),
     costs,
+    assisted: await assistedStep(env.DB, caseId),
   };
 }
 
-async function ingestInboundText(env: Env, caseId: string, body: string) {
+// The pending assisted-lane step for this case, if any: the drafted message
+// the customer needs to carry into the merchant's own support channel.
+async function assistedStep(db: D1Database, caseId: string) {
+  const row = await q1<{ id: string; result_json: string | null; created_at: string }>(
+    db,
+    `SELECT id, result_json, created_at FROM case_actions WHERE case_id = ? AND status = 'awaiting_customer' ORDER BY created_at DESC LIMIT 1`,
+    caseId,
+  );
+  if (!row) return null;
+  const r = json<{ draft?: string; target?: string | null }>(row.result_json, {});
+  return { actionId: row.id, draft: r.draft ?? "", target: r.target ?? "the merchant's support page", createdAt: row.created_at };
+}
+
+// Evidence upload guardrails: generous but bounded, and never executable.
+const MAX_EVIDENCE_BYTES = 10 * 1024 * 1024;
+const EVIDENCE_MIME_ALLOW = new Set([
+  "image/png", "image/jpeg", "image/webp", "image/gif",
+  "application/pdf", "text/plain", "text/csv", "message/rfc822",
+]);
+
+// Limits for inbound email attachments (merchant-originated, least trust).
+const MAX_ATTACH_BYTES = 5 * 1024 * 1024;
+const MAX_ATTACH_TOTAL = 15 * 1024 * 1024;
+
+async function ingestInboundText(
+  env: Env,
+  caseId: string,
+  body: string,
+  opts?: { subject?: string; meta?: Record<string, unknown>; externalId?: string | null },
+) {
   const caseRow = await getCase(env.DB, caseId);
   if (!caseRow) return;
   const conv = await q1<{ id: string }>(
@@ -386,11 +477,162 @@ async function ingestInboundText(env: Env, caseId: string, body: string) {
     `SELECT id FROM external_conversations WHERE case_id = ? ORDER BY created_at DESC LIMIT 1`,
     caseId,
   );
-  const convId = conv?.id ?? (await (async () => {
-    const { ensureConversation } = await import("./core/agent");
-    return ensureConversation(env.DB, caseId, "email", "inbound");
-  })());
-  await ingestMerchantMessage(env, caseRow, convId, body);
+  const convId = conv?.id ?? (await ensureConversation(env.DB, caseId, "email", "inbound"));
+  await ingestMerchantMessage(env, caseRow, convId, body, opts);
+}
+
+// Full inbound pipeline for a parsed email (Email Routing handler + tests).
+// Returns 'processed' | 'duplicate' | 'rejected'. Rejected mail is bounced back
+// to the sender by setReject in the caller.
+export async function ingestInboundEmail(
+  env: Env,
+  parsed: {
+    to: string;
+    from?: string;
+    subject?: string;
+    body: string;
+    messageId?: string | null;
+    inReplyTo?: string | null;
+    references?: string | string[] | null;
+    attachments?: { filename: string; mimeType: string; content: ArrayBuffer | Uint8Array }[];
+  },
+): Promise<{ result: string; caseId?: string }> {
+  const inboundDomain = env.INBOUND_ADDRESS?.split("@")[1] ?? env.EMAIL_DOMAIN ?? "agentmasterkey.com";
+
+  // Domain guard: only mail addressed to our inbound domain is case mail.
+  if (!parsed.to.toLowerCase().endsWith(`@${inboundDomain}`)) {
+    await auditEvent(env.DB, { type: "inbound_wrong_domain", severity: "warning", data: { to: parsed.to } });
+    return { result: "rejected" };
+  }
+
+  // Idempotent: the same RFC message-id is never ingested twice, even if Email
+  // Routing retries delivery.
+  if (parsed.messageId) {
+    const dup = await q1<{ id: string }>(
+      env.DB,
+      `SELECT id FROM external_messages WHERE external_id = ? LIMIT 1`,
+      parsed.messageId,
+    );
+    if (dup) {
+      await auditEvent(env.DB, { type: "inbound_duplicate", severity: "info", data: { messageId: parsed.messageId } });
+      return { result: "duplicate" };
+    }
+  }
+
+  const threadIds = extractMessageIds([
+    parsed.inReplyTo ?? undefined,
+    parsed.references ?? undefined,
+    parsed.messageId ?? undefined,
+  ]);
+  const caseId = await resolveInboundCase(env.DB, {
+    to: parsed.to,
+    subject: parsed.subject ?? "",
+    messageIds: threadIds,
+  });
+  if (!caseId) {
+    await auditEvent(env.DB, { type: "inbound_unmatched", severity: "warning", data: { to: parsed.to, subject: parsed.subject } });
+    return { result: "rejected" };
+  }
+
+  // Sender/recipient metadata is retained with the message — audit trail.
+  await ingestInboundText(env, caseId, parsed.body || "(no body)", {
+    subject: parsed.subject ?? "",
+    externalId: parsed.messageId ?? null,
+    meta: {
+      channel: "email",
+      from: parsed.from ?? "",
+      to: parsed.to,
+      messageId: parsed.messageId ?? null,
+      inReplyTo: parsed.inReplyTo ?? null,
+      receivedVia: "cloudflare_email_routing",
+    },
+  });
+
+  // Attachments: bounded, hashed, stored under randomized case-scoped keys,
+  // provenance=merchant. Oversized/skipped ones are still noted for the trail.
+  let total = 0;
+  for (const att of parsed.attachments ?? []) {
+    const bytes = att.content instanceof Uint8Array ? att.content : new Uint8Array(att.content);
+    total += bytes.byteLength;
+    const mimeOk = EVIDENCE_MIME_ALLOW.has(att.mimeType) || att.mimeType === "message/rfc822";
+    if (bytes.byteLength > MAX_ATTACH_BYTES || total > MAX_ATTACH_TOTAL || !mimeOk) {
+      await caseEvent(env.DB, caseId, "attachment_skipped", "system", {
+        filename: att.filename, sizeBytes: bytes.byteLength,
+        reason: !mimeOk ? "mime not allowed" : "size limit",
+      });
+      continue;
+    }
+    const kind = att.mimeType.startsWith("image/") ? "image" : att.mimeType === "application/pdf" ? "pdf" : "email";
+    await addEvidence(env.DB, env, caseId, {
+      kind: kind as never,
+      blob: bytes,
+      mime: att.mimeType,
+      source: "merchant",
+      label: `Email attachment: ${att.filename}`,
+    });
+  }
+  return { result: "processed", caseId };
+}
+
+// ---------------------------------------------------------------------------
+// Customer data control: full export + full delete. Retention: nothing is
+// kept beyond the user relationship in V1 — audit rows tied to the user are
+// removed too (documented in docs/SECURITY.md).
+// ---------------------------------------------------------------------------
+
+async function exportAccount(env: Env, uid: string) {
+  const tables: [string, string][] = [
+    ["cases", `SELECT * FROM cases WHERE user_id = ?`],
+    ["case_claims", `SELECT * FROM case_claims WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`],
+    ["case_evidence", `SELECT id, case_id, kind, text, mime, size_bytes, sha256, source, label, created_at FROM case_evidence WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`],
+    ["external_conversations", `SELECT * FROM external_conversations WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`],
+    ["external_messages", `SELECT m.* FROM external_messages m JOIN external_conversations c ON c.id = m.conversation_id WHERE c.case_id IN (SELECT id FROM cases WHERE user_id = ?)`],
+    ["case_mandates", `SELECT * FROM case_mandates WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`],
+    ["approval_requests", `SELECT a.* FROM approval_requests a JOIN cases c ON c.id = a.case_id WHERE c.user_id = ?`],
+    ["case_events", `SELECT * FROM case_events WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`],
+    ["outcome_events", `SELECT * FROM outcome_events WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`],
+    ["follow_ups", `SELECT f.* FROM follow_ups f JOIN cases c ON c.id = f.case_id WHERE c.user_id = ?`],
+    ["case_actions", `SELECT * FROM case_actions WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`],
+    ["case_plans", `SELECT * FROM case_plans WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`],
+    ["connections", `SELECT id, type, provider, label, status, meta, created_at FROM connections WHERE user_id = ?`],
+  ];
+  const out: Record<string, unknown> = {
+    exportedAt: nowIso(),
+    user: await q1(env.DB, `SELECT id, email, created_at FROM users WHERE id = ?`, uid),
+  };
+  for (const [name, sql] of tables) out[name] = await q(env.DB, sql, uid);
+  return out;
+}
+
+async function deleteAccount(env: Env, uid: string, sessionToken: string) {
+  // Evidence objects in R2 first (they're the biggest + hardest to re-create).
+  if (env.EVIDENCE) {
+    const keys = await q<{ r2_key: string }>(
+      env.DB,
+      `SELECT r2_key FROM case_evidence WHERE r2_key IS NOT NULL AND case_id IN (SELECT id FROM cases WHERE user_id = ?)`,
+      uid,
+    );
+    for (const k of keys) await env.EVIDENCE.delete(k.r2_key).catch(() => undefined);
+  }
+  const del = async (sql: string) => run(env.DB, sql, uid);
+  await del(`DELETE FROM external_messages WHERE conversation_id IN (SELECT id FROM external_conversations WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?))`);
+  await del(`DELETE FROM external_conversations WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
+  await del(`DELETE FROM case_evidence WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
+  await del(`DELETE FROM case_claims WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
+  await del(`DELETE FROM case_actions WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
+  await del(`DELETE FROM case_plans WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
+  await del(`DELETE FROM case_mandates WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
+  await del(`DELETE FROM approval_requests WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
+  await del(`DELETE FROM follow_ups WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
+  await del(`DELETE FROM outcome_events WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
+  await del(`DELETE FROM case_events WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
+  await del(`DELETE FROM cost_events WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
+  await del(`DELETE FROM cases WHERE user_id = ?`);
+  await del(`DELETE FROM connections WHERE user_id = ?`);
+  await del(`DELETE FROM sessions WHERE user_id = ?`);
+  await del(`DELETE FROM audit_events WHERE user_id = ?`);
+  await run(env.DB, `DELETE FROM users WHERE id = ?`, uid);
+  void sessionToken;
 }
 
 export default {
@@ -431,22 +673,34 @@ export default {
     ctx.waitUntil(runFollowUpSweep(env).then((r) => console.log(`[sweep] fired=${r.fired}`)));
   },
 
-  // Inbound email via Cloudflare Email Routing.
+  // Inbound email via Cloudflare Email Routing (real public route — a literal
+  // rule on the zone points env.INBOUND_ADDRESS at this handler). Proper MIME
+  // decode via postal-mime; ingestInboundEmail handles domain guard, message-id
+  // dedup, case resolution, metadata retention, attachments, and the untrusted
+  // content pipeline.
   async email(message: ForwardableEmailMessage, env: Env, _ctx: ExecutionContext): Promise<void> {
     try {
-      const raw = await new Response(message.raw).text();
-      const parsed = parseInbound(raw);
-      const caseId = await resolveInboundCase(env.DB, {
-        to: message.to || parsed.to,
-        subject: parsed.subject,
-        headers: parsed.headers,
+      const parsed = await PostalMime.parse(message.raw);
+      const to = parsed.to?.[0]?.address ?? message.to ?? "";
+      // Prefer text/plain; fall back to a tag-stripped html render.
+      const body = parsed.text ?? (parsed.html ?? "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+      const r = await ingestInboundEmail(env, {
+        to,
+        from: parsed.from?.address ?? "",
+        subject: parsed.subject ?? "",
+        body,
+        messageId: parsed.messageId ?? null,
+        inReplyTo: parsed.inReplyTo ?? null,
+        references: parsed.references ?? null,
+        attachments: (parsed.attachments ?? [])
+          .filter((a) => a.disposition === "attachment" && a.filename)
+          .map((a) => ({
+            filename: a.filename ?? "attachment",
+            mimeType: a.mimeType,
+            content: typeof a.content === "string" ? new TextEncoder().encode(a.content) : a.content,
+          })),
       });
-      if (!caseId) {
-        await auditEvent(env.DB, { type: "inbound_unmatched", severity: "warning", data: { to: message.to } });
-        message.setReject("no matching case");
-        return;
-      }
-      await ingestInboundText(env, caseId, parsed.body || "(no body)");
+      if (r.result === "rejected") message.setReject("no matching case");
     } catch (e) {
       await auditEvent(env.DB, { type: "inbound_error", severity: "error", data: { error: String(e) } });
       message.setReject("processing error");
