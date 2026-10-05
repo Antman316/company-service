@@ -23,7 +23,7 @@ export function CaseDetail({ id, nav }: { id: string; nav: (to: string) => void 
 
   async function act(name: string, fn: () => Promise<any>) {
     setBusy(name);
-    try { await fn(); load(); } catch (e: any) { setErr(e.message); } finally { setBusy(null); }
+    try { setErr(null); await fn(); load(); } catch (e: any) { setErr(e.message); } finally { setBusy(null); }
   }
 
   async function decide(approvalId: string, optionId: string) {
@@ -34,8 +34,9 @@ export function CaseDetail({ id, nav }: { id: string; nav: (to: string) => void 
     await act("upload", () => api.uploadEvidence(id, file));
   }
 
-  if (err) return <div className="page"><div className="error-box">{err}</div></div>;
-  if (!d) return <div className="page"><span className="spinner" /></div>;
+  if (!d) {
+    return <div className="page">{err ? <div className="error-box">{err}</div> : <span className="spinner" />}</div>;
+  }
 
   const c = d.case;
   const pendingApprovals = (d.approvals ?? []).filter((a: any) => a.status === "pending");
@@ -45,6 +46,7 @@ export function CaseDetail({ id, nav }: { id: string; nav: (to: string) => void 
   return (
     <div className="page">
       <a href="#/app" className="small muted">← All cases</a>
+      {err && <div className="error-box" style={{ marginTop: 10 }}>{err}</div>}
       <div style={{ display: "flex", alignItems: "flex-start", gap: 14, marginTop: 8, flexWrap: "wrap" }}>
         <div style={{ flex: 1, minWidth: 240 }}>
           <h1 style={{ margin: 0, letterSpacing: "-.02em", fontSize: 26 }}>{c.title}</h1>

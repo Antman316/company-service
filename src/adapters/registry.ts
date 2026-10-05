@@ -128,12 +128,12 @@ export async function checkCoverage(
 // UNVERIFIED/ASSISTED entries for real retailers — we do not claim real
 // retailer automation.
 export async function seedRegistry(db: D1Database): Promise<void> {
-  const existing = await q<{ id: string }>(db, `SELECT id FROM companies LIMIT 1`);
-  if (existing.length > 0) return;
-
+  // Idempotent per-row seeding: new coverage rows propagate to databases that
+  // were seeded before they existed (early-return-on-nonempty caused exactly
+  // that gap on prod).
   const testCo = "cmp_testmerchant";
   await db
-    .prepare(`INSERT INTO companies (id, name, domains, adapter_id, notes) VALUES (?,?,?,?,?)`)
+    .prepare(`INSERT OR IGNORE INTO companies (id, name, domains, adapter_id, notes) VALUES (?,?,?,?,?)`)
     .bind(
       testCo,
       "Test Merchant",
@@ -144,7 +144,7 @@ export async function seedRegistry(db: D1Database): Promise<void> {
     .run();
 
   const cov = db.prepare(
-    `INSERT INTO company_coverage (id, company_id, issue_type, channel, auth_requirements, automation_level, limitations, verification_status, adapter_version, health, notes, channel_address)
+    `INSERT OR IGNORE INTO company_coverage (id, company_id, issue_type, channel, auth_requirements, automation_level, limitations, verification_status, adapter_version, health, notes, channel_address)
      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
   );
   for (const channel of ["email", "chat"]) {
@@ -174,7 +174,7 @@ export async function seedRegistry(db: D1Database): Promise<void> {
   ];
   for (const c of real) {
     await db
-      .prepare(`INSERT INTO companies (id, name, domains, adapter_id, notes) VALUES (?,?,?,?,?)`)
+      .prepare(`INSERT OR IGNORE INTO companies (id, name, domains, adapter_id, notes) VALUES (?,?,?,?,?)`)
       .bind(c.id, c.name, JSON.stringify(c.domains), null, "Real company — no verified integration in V1.")
       .run();
     await cov

@@ -42,7 +42,10 @@ export const api = {
       method: "POST", body: form, credentials: "same-origin",
       headers: csrfToken ? { "x-csrf": csrfToken } : {},
     });
-    if (!r.ok) throw new ApiError(r.status, "upload failed");
+    if (!r.ok) {
+      const body = await r.json().catch(() => ({}));
+      throw new ApiError(r.status, (body as any)?.error ?? `upload failed (HTTP ${r.status})`);
+    }
     return r.json();
   },
   grantMandate: (id: string, m: { authorized: string[]; approvalRequired: string[]; prohibited?: string[]; expiresAt?: string }) =>
