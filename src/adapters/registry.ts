@@ -241,7 +241,7 @@ export async function seedRegistry(db: D1Database): Promise<void> {
       "none — public support email; account-specific actions escalate to MANUAL",
       "AUTOMATED",
       "Verified only for initiating contact and ingesting replies (auto-acknowledgements). No order-data access; outcome not guaranteed; merchant may require account verification for order-specific changes.",
-      "UNVERIFIED",
+      "VERIFIED",
       null,
       "unknown",
       "Official support email published by Chewy help content.",
