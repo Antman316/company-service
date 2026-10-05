@@ -8,3 +8,9 @@ web/dist/
 coverage/
 .vite/
 tsconfig.tsbuildinfo
+
+
+# build artifacts
+dist-worker/
+dist/
+web/dist/

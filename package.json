@@ -3,14 +3,15 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Company Service — an AI consumer representative that deals with companies on your behalf.",
+  "description": "Company Service \u2014 an AI consumer representative that deals with companies on your behalf.",
   "scripts": {
     "dev": "wrangler dev --port 8787",
     "build": "vite build",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p web/tsconfig.json",
     "test": "vitest run",
     "migrate:local": "wrangler d1 migrations apply company-service-db --local",
-    "deploy": "npm run build && wrangler deploy"
+    "deploy": "npm run build && node scripts/gen-static.mjs && wrangler deploy",
+    "gen:static": "node scripts/gen-static.mjs"
   },
   "dependencies": {
     "react": "^19.1.0",

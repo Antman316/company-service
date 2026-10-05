@@ -46,9 +46,12 @@ const KNOWN_COMPANIES = [
 function extractObjective(text: string) {
   const lower = text.toLowerCase();
   const known = KNOWN_COMPANIES.find((c) => lower.includes(c));
+  const capitalRun = text.match(/([A-Z][A-Za-z0-9&.'-]*(?:\s+[A-Z][A-Za-z0-9&.'-]*){0,3})/)?.[1];
   const company = (known ? known.replace(/\b\w/g, (ch) => ch.toUpperCase()) : null) ??
-    (lower.match(/(?:order|from|with|to)\s+(?:the\s+)?([A-Z][A-Za-z0-9&.' -]{2,25})/)?.[1]?.trim()) ??
-    (text.match(/([A-Z][A-Za-z0-9&.'-]*(?:\s+[A-Z][A-Za-z0-9&.'-]*){0,3})/)?.[1] ?? "unknown company");
+    (text.match(/(?:called|from|with|to|order(?:ed)?\s+from)\s+(?:the\s+)?([A-Z][A-Za-z0-9&.'-]{1,24}(?:\s+[A-Z][A-Za-z0-9&.'-]{1,24}){0,3})/)?.[1]?.trim()) ??
+    // Generic capitalized run — skip sentence-initial articles/pronouns and
+    // single letters so "A company called…" doesn't become the company name.
+    (capitalRun && capitalRun.length > 1 && !/^(A|An|The|I|We|My|This|It|They)\b/.test(capitalRun) ? capitalRun : "unknown company");
   const amountMatch = text.match(/\$\s*(\d+(?:,\d{3})*(?:\.\d{1,2})?)/);
   const amountCents = amountMatch ? Math.round(parseFloat(amountMatch[1]!.replace(/,/g, "")) * 100) : null;
   let issueType = "other_post_purchase";
