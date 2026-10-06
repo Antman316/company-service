@@ -13,7 +13,20 @@ import { caseEvent, auditEvent } from "./events";
 import { dueFollowUps, markFired, scheduleFollowUp, cancelFollowUps } from "./followups";
 import { getActiveMandate } from "./mandate";
 import { latestOutcome, recordOutcome } from "./outcomes";
+import { describeAction, nextProposedAction, proposeAction } from "./actions";
 import { classifyAction, classifyMerchantOffer } from "./policy";
+import {
+  addDeadline,
+  advanceRung,
+  bumpDeflectionStreak,
+  deflectionNudgeBody,
+  detectDeflection,
+  executeDraftAction,
+  hasMissedPromiseDeadline,
+  resetDeflectionStreak,
+  runDeadlineSweep,
+  syncEscalationStatus,
+} from "./escalation";
 import type { CaseRow, CaseState, ExecutionContext } from "./types";
 
 const MAX_STEPS_PER_CYCLE = 8;
@@ -73,6 +86,7 @@ export function suggestedMandate(input: { amountCents?: number | null; orderRef?
       "share_evidence",
       "follow_up",
       "request_escalation",
+      "contact_executive",
     ],
     approvalRequired: [
       "accept_partial_refund",
@@ -246,19 +260,25 @@ export async function advanceCase(
 
     if (decision.policyClass === "PROHIBITED") {
       await run(db, `UPDATE case_actions SET status = 'rejected', error = ? WHERE id = ?`, decision.reason, action.id);
+      await syncEscalationStatus(db, action.id);
       await auditEvent(db, { caseId, type: "action_prohibited", severity: "warning", data: { kind: action.kind, reason: decision.reason } });
       continue;
     }
     if (decision.policyClass === "UNSUPPORTED") {
       await run(db, `UPDATE case_actions SET status = 'skipped', error = ? WHERE id = ?`, decision.reason, action.id);
+      await syncEscalationStatus(db, action.id);
       continue;
     }
     if (decision.policyClass === "USER_APPROVAL_REQUIRED") {
       await run(db, `UPDATE case_actions SET status = 'awaiting_approval' WHERE id = ?`, action.id);
+      await syncEscalationStatus(db, action.id);
+      const isDraft = action.kind.startsWith("draft_");
       const approvalId = await createApproval(db, caseId, {
         actionId: action.id,
         kind: "action_approval",
-        summary: `Company Service wants to: ${describeAction(action.kind)}. Reason: ${decision.reason}`,
+        summary: isDraft
+          ? `Draft ready for your review: ${describeAction(action.kind)} — you review it and file it yourself; the system never files on your behalf.`
+          : `Company Service wants to: ${describeAction(action.kind)}. Reason: ${decision.reason}`,
         detail: { actionKind: action.kind, payload: json(action.payload_json, {}) },
         options: [
           { id: "approve", label: "Approve", kind: "approve" },
@@ -278,57 +298,15 @@ export async function advanceCase(
       channelAddress: coverage.channelAddress,
       assisted: coverage.coverage === "assisted",
     });
+    await syncEscalationStatus(db, action.id);
     if (!outcome.continue) return { caseId, status: outcome.status ?? caseRow.status, stepsRun };
   }
 
   return { caseId, status: (await getCase(db, caseId))!.status, stepsRun };
 }
 
-function describeAction(kind: string): string {
-  return kind.replace(/_/g, " ");
-}
-
-async function nextProposedAction(db: D1Database, caseId: string) {
-  return q1<{
-    id: string; kind: string; payload_json: string | null; plan_id: string | null;
-  }>(
-    db,
-    `SELECT id, kind, payload_json, plan_id FROM case_actions
-     WHERE case_id = ? AND status = 'proposed' ORDER BY created_at ASC LIMIT 1`,
-    caseId,
-  );
-}
-
-async function proposeAction(
-  db: D1Database,
-  caseId: string,
-  kind: string,
-  payload: Record<string, unknown>,
-  idempotencyKey: string,
-  planId?: string | null,
-): Promise<string | null> {
-  // Idempotent: same logical action never proposed twice.
-  const existing = await q1<{ id: string }>(
-    db,
-    `SELECT id FROM case_actions WHERE idempotency_key = ?`,
-    idempotencyKey,
-  );
-  if (existing) return existing.id;
-  const id = newId("act");
-  await run(
-    db,
-    `INSERT INTO case_actions (id, case_id, plan_id, kind, payload_json, policy_class, idempotency_key)
-     VALUES (?,?,?,?,?,?,?)`,
-    id,
-    caseId,
-    planId ?? null,
-    kind,
-    JSON.stringify(payload),
-    "AUTO_ALLOWED",
-    idempotencyKey,
-  );
-  return id;
-}
+// Propose/classify plumbing lives in ./actions (shared with the escalation
+// engine without a module cycle).
 
 async function ensurePlan(env: Env, caseRow: CaseRow, mandate: unknown): Promise<void> {
   const db = env.DB;
@@ -380,17 +358,18 @@ async function executeAction(
   const adapter = getAdapter(companyId === "cmp_testmerchant" ? "test-merchant" : (await adapterFor(db, companyId)) ?? "");
   const scenario = caseScenario(caseRow);
 
-  if (action.kind === "send_message" || action.kind === "send_followup" || action.kind === "request_escalation") {
-    return sendMerchantMessage(env, caseRow, action, channel, scenario, adapter ? "test-merchant" : null, coverage);
-  }
-  if (action.kind === "send_email") {
-    return sendMerchantMessage(env, caseRow, action, "email", scenario, adapter ? "test-merchant" : null, coverage);
-  }
-  if (action.kind === "request_refund_status" || action.kind === "check_merchant_status") {
-    return sendMerchantMessage(env, caseRow, action, channel, scenario, adapter ? "test-merchant" : null, coverage);
-  }
-  if (action.kind === "share_evidence" || action.kind === "share_order_number" || action.kind === "share_tracking_number") {
-    return sendMerchantMessage(env, caseRow, action, channel, scenario, adapter ? "test-merchant" : null, coverage);
+  // Everything that talks to a merchant is a send over the case's channel.
+  // contact_executive always goes over email to the playbook's executive contact.
+  const SEND_KINDS = new Set([
+    "send_message", "send_email", "send_followup", "request_escalation",
+    "request_refund_status", "check_merchant_status",
+    "share_evidence", "share_order_number", "share_tracking_number",
+    "escalate_policy_cite", "escalate_request_human", "escalate_supervisor",
+    "contact_executive",
+  ]);
+  if (SEND_KINDS.has(action.kind)) {
+    const chan = action.kind === "contact_executive" ? "email" : channel;
+    return sendMerchantMessage(env, caseRow, action, chan, scenario, adapter ? "test-merchant" : null, coverage);
   }
   // Gated kinds should never reach here unapproved; defense in depth.
   await run(db, `UPDATE case_actions SET status = 'skipped', error = 'unhandled kind at execution' WHERE id = ?`, action.id);
@@ -446,7 +425,7 @@ async function sendMerchantMessage(
   // zero bot evasion — and pastes the reply back. That reply re-enters this
   // same ingest pipeline via /assisted/reply.
   if (coverage.assisted) {
-    const msgId = await recordMessage(db, conv, "out", subject, body, "drafted", {
+    const { id: msgId } = await recordMessage(db, conv, "out", subject, body, "drafted", {
       transport: "assisted",
       channel,
       target: coverage.channelAddress ?? "merchant support page",
@@ -470,7 +449,7 @@ async function sendMerchantMessage(
     return { continue: false, status: "WAITING_FOR_CUSTOMER" };
   }
 
-  const outboundMsgId = await recordMessage(db, conv, "out", subject, body, "queued");
+  const { id: outboundMsgId } = await recordMessage(db, conv, "out", subject, body, "queued");
 
   const ctx: ExecutionContext = {
     caseId: caseRow.id,
@@ -495,7 +474,8 @@ async function sendMerchantMessage(
       return { continue: true };
     }
   } else if (channel === "email") {
-    const to = adapterId === "test-merchant" ? TEST_MERCHANT_EMAIL : (coverage.channelAddress ?? "");
+    const payloadTo = json<{ to?: string }>(action.payload_json, {}).to;
+    const to = payloadTo ?? (adapterId === "test-merchant" ? TEST_MERCHANT_EMAIL : (coverage.channelAddress ?? ""));
     if (!to) {
       await run(db, `UPDATE case_actions SET status='failed', error='no destination address registered for email channel' WHERE id=?`, action.id);
       await run(db, `UPDATE external_messages SET status='failed' WHERE id=?`, outboundMsgId);
@@ -596,16 +576,16 @@ export async function recordMessage(
   status: string,
   meta?: Record<string, unknown>,
   externalId?: string | null,
-): Promise<string> {
+): Promise<{ id: string; duplicate: "external_id" | "content" | null }> {
   // Two dedup anchors: provider message-id (exact) and content hash (fallback).
   if (externalId) {
     const byId = await q1<{ id: string }>(db, `SELECT id FROM external_messages WHERE external_id = ?`, externalId);
-    if (byId) return byId.id;
+    if (byId) return { id: byId.id, duplicate: "external_id" };
   }
   const dedup = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${conversationId}:${direction}:${body}`))
     .then((d) => Array.from(new Uint8Array(d)).map((b) => b.toString(16).padStart(2, "0")).join(""));
   const existing = await q1<{ id: string }>(db, `SELECT id FROM external_messages WHERE dedup_hash = ?`, dedup);
-  if (existing) return existing.id;
+  if (existing) return { id: existing.id, duplicate: "content" };
   const id = newId("msg");
   await run(
     db,
@@ -621,7 +601,7 @@ export async function recordMessage(
     dedup,
     externalId ?? null,
   );
-  return id;
+  return { id, duplicate: null };
 }
 
 // ---------------------------------------------------------------------------
@@ -637,7 +617,7 @@ export async function ingestMerchantMessage(
   opts?: { subject?: string; meta?: Record<string, unknown>; externalId?: string | null },
 ): Promise<void> {
   const db = env.DB;
-  await recordMessage(
+  const stored = await recordMessage(
     db,
     conversationId,
     "in",
@@ -647,13 +627,20 @@ export async function ingestMerchantMessage(
     opts?.meta,
     opts?.externalId,
   );
-  await addEvidence(db, env, caseRow.id, {
-    kind: "merchant_reply",
-    text: body,
-    source: "merchant",
-    label: "Merchant reply",
-  });
-  await caseEvent(db, caseRow.id, "message_received", "merchant", { preview: body.slice(0, 200) });
+  // A transport-level retry (same provider Message-ID) adds nothing. A
+  // content-identical repeat is a genuinely new delivery — real deflection
+  // signal — so it still gets analyzed below, but we don't append a second
+  // identical evidence row to the bundle.
+  if (stored.duplicate === "external_id") return;
+  if (stored.duplicate !== "content") {
+    await addEvidence(db, env, caseRow.id, {
+      kind: "merchant_reply",
+      text: body,
+      source: "merchant",
+      label: "Merchant reply",
+    });
+  }
+  await caseEvent(db, caseRow.id, "message_received", "merchant", { preview: body.slice(0, 200), duplicate: stored.duplicate === "content" });
 
   const analysis = await runModel(env, { userId: caseRow.user_id, caseId: caseRow.id }, {
     role: "light",
@@ -669,6 +656,7 @@ export async function ingestMerchantMessage(
     offerKind?: string | null;
     injectionDetected?: boolean;
     injectionMatches?: string[];
+    deflection?: boolean;
   };
 
   const heuristic = detectInjection(body);
@@ -694,6 +682,64 @@ export async function ingestMerchantMessage(
   const mandate = await getActiveMandate(db, caseRow.id);
   const intent = parsed.intent ?? "other";
 
+  // -------------------------------------------------------------------
+  // Deflection layer (M3). Runs on every inbound merchant message,
+  // independent of the model's intent label — deterministic detection plus
+  // the model's own deflection flag, OR'ed. A denial counts as a hard
+  // deflection; a promise past an open promised-date deadline does too.
+  // -------------------------------------------------------------------
+  const priors = await q<{ body: string }>(
+    db,
+    `SELECT m.body FROM external_messages m JOIN external_conversations c ON c.id = m.conversation_id
+     WHERE c.case_id = ? AND m.direction = 'in' ORDER BY m.created_at DESC, m.rowid DESC LIMIT 6`,
+    caseRow.id,
+  );
+  const priorBodies = priors.map((r) => r.body).slice(1); // [0] is this message
+  const det = detectDeflection(body, priorBodies);
+  const isDenial = intent === "denial";
+  const missedPromise = intent === "promise" ? await hasMissedPromiseDeadline(db, caseRow.id) : false;
+  const isDeflection = det.deflection || isDenial || parsed.deflection === true || missedPromise;
+
+  if (isDeflection) {
+    const streak = await bumpDeflectionStreak(db, caseRow.id);
+    await caseEvent(db, caseRow.id, "deflection_detected", "system", {
+      signals: det.signals,
+      intent,
+      streak,
+      modelFlag: parsed.deflection === true,
+      pastDeadlinePromise: missedPromise,
+    });
+    if (isDenial) {
+      await recordOutcome(db, caseRow.id, "DENIED", `Merchant denied the request: ${body.slice(0, 200)}`, { actor: "merchant" });
+    }
+    if (streak >= 2 || isDenial || missedPromise) {
+      await resetDeflectionStreak(db, caseRow.id);
+      const adv = await advanceRung(
+        env,
+        caseRow,
+        isDenial ? "denial" : missedPromise ? "past-deadline promise" : "consecutive deflections",
+      );
+      if (!adv) {
+        await recordOutcome(db, caseRow.id, "UNRESOLVED", "Escalation ladder exhausted — no further automated rungs.", { actor: "system" });
+        await transitionIfAble(db, caseRow.id, "UNRESOLVED", "escalation exhausted");
+      }
+      return;
+    }
+    // First deflection — nudge for a substantive answer (a normal follow-up,
+    // still inside the mandate; the ladder engages on the second).
+    const convN = await replyCount(db, conversationId);
+    await proposeAction(
+      db,
+      caseRow.id,
+      "send_followup",
+      { body: deflectionNudgeBody(caseRow) },
+      `${caseRow.id}:nudge:${convN}`,
+    );
+    await transitionIfAble(db, caseRow.id, "IN_PROGRESS", "deflection — nudging for a substantive reply");
+    return;
+  }
+  await resetDeflectionStreak(db, caseRow.id);
+
   switch (intent) {
     case "acknowledgment": {
       await recordOutcome(db, caseRow.id, "ACKNOWLEDGED", "Merchant acknowledged the case.", { actor: "merchant" });
@@ -718,6 +764,14 @@ export async function ingestMerchantMessage(
         addMs(nowIso(), Math.max(days, 1) * 24 * 3600 * 1000),
         { expected: "resolution" },
       );
+      // The promised date is a tracked deadline, honestly labeled as the
+      // merchant's own statement.
+      await addDeadline(db, caseRow.id, {
+        kind: "promised_date",
+        dueAt: addMs(nowIso(), Math.max(days, 1) * 24 * 3600 * 1000),
+        source: "MERCHANT_STATED",
+        note: `merchant stated ~${days} day(s)`,
+      });
       break;
     }
     case "resolution": {
@@ -768,16 +822,7 @@ export async function ingestMerchantMessage(
       }
       break;
     }
-    case "denial": {
-      await recordOutcome(db, caseRow.id, "DENIED", `Merchant denied the request: ${body.slice(0, 200)}`, { actor: "merchant" });
-      if (mandate?.authorized.includes("request_escalation")) {
-        await proposeAction(db, caseRow.id, "request_escalation", {}, `${caseRow.id}:escalate:${await replyCount(db, conversationId)}`);
-        await transitionIfAble(db, caseRow.id, "ESCALATION_REQUIRED", "merchant denied — escalation authorized");
-      } else {
-        await transitionIfAble(db, caseRow.id, "UNRESOLVED", "merchant denied; no escalation authorized");
-      }
-      break;
-    }
+
     case "evidence_request": {
       await transitionIfAble(db, caseRow.id, "WAITING_FOR_CUSTOMER", "merchant requested additional evidence");
       await createApproval(db, caseRow.id, {
@@ -831,7 +876,13 @@ async function transitionIfAble(db: D1Database, caseId: string, to: CaseState, r
 // threshold, escalate.
 // ---------------------------------------------------------------------------
 
-export async function runFollowUpSweep(env: Env): Promise<{ fired: number }> {
+export async function runFollowUpSweep(env: Env): Promise<{ fired: number; deadlines?: { warned: number; missed: number } }> {
+  // Deadlines first: a missed promised-date advances the escalation ladder,
+  // then the new rung's send runs through the normal action loop.
+  const deadlines = await runDeadlineSweep(env);
+  for (const caseId of deadlines.advanceCaseIds) {
+    await advanceCase(env, caseId, "deadline_missed");
+  }
   const due = await dueFollowUps(env.DB);
   let fired = 0;
   for (const f of due) {
@@ -860,7 +911,7 @@ export async function runFollowUpSweep(env: Env): Promise<{ fired: number }> {
     await transitionIfAble(env.DB, f.case_id, "IN_PROGRESS", "processing follow-up");
     await advanceCase(env, f.case_id, `followup:${f.id}`);
   }
-  return { fired };
+  return { fired, deadlines };
 }
 
 // ---------------------------------------------------------------------------
@@ -920,12 +971,32 @@ export async function handleApprovalDecision(env: Env, approvalId: string): Prom
   // action_approval (generic gated action)
   if (row.action_id) {
     if (row.status === "approved") {
+      const act = await q1<{ id: string; kind: string; payload_json: string | null }>(
+        db,
+        `SELECT id, kind, payload_json FROM case_actions WHERE id = ?`,
+        row.action_id,
+      );
       await run(db, `UPDATE case_actions SET status = 'approved' WHERE id = ?`, row.action_id);
+      if (act && (act.kind === "draft_chargeback" || act.kind === "draft_complaint")) {
+        // Approving a draft materializes the document — it never sends anything.
+        await executeDraftAction(env, caseRow, act);
+        await transitionIfAble(db, row.case_id, "WAITING_FOR_CUSTOMER", "draft ready — review it and file it yourself; the system never files on your behalf");
+        return;
+      }
       await transitionIfAble(db, row.case_id, "IN_PROGRESS", "action approved");
       await advanceCase(env, row.case_id, "approval:action-approved");
     } else {
       await run(db, `UPDATE case_actions SET status = 'rejected' WHERE id = ?`, row.action_id);
-      await recordOutcome(db, row.case_id, "UNRESOLVED", "Customer declined the proposed action.", { actor: "customer" });
+      await syncEscalationStatus(db, row.action_id);
+      const act = await q1<{ kind: string }>(db, `SELECT kind FROM case_actions WHERE id = ?`, row.action_id);
+      if (act && (act.kind === "draft_chargeback" || act.kind === "draft_complaint")) {
+        // Declining a draft isn't a resolution — the case just keeps waiting.
+        await caseEvent(db, row.case_id, "draft_declined", "customer", { actionId: row.action_id, kind: act.kind });
+        await transitionIfAble(db, row.case_id, "WAITING_FOR_COMPANY", "customer declined the draft — continuing with the merchant");
+        await scheduleFollowUp(db, row.case_id, "check_commitment", addMs(nowIso(), 2 * 24 * 3600 * 1000));
+      } else {
+        await recordOutcome(db, row.case_id, "UNRESOLVED", "Customer declined the proposed action.", { actor: "customer" });
+      }
     }
   }
 }

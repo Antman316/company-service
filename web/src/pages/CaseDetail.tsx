@@ -6,6 +6,21 @@ const PROV_TONE: Record<string, string> = {
   SYSTEM_VERIFIED: "green", INFERRED: "", CONFLICTING: "red", UNKNOWN: "",
 };
 
+const RUNG_LABELS: Record<number, string> = {
+  1: "Restate facts + cite their policy",
+  2: "Request human agent + reference",
+  3: "Request supervisor + deadline",
+  4: "Executive / corporate relations",
+  5: "Draft card-dispute letter (you file it)",
+  6: "Draft regulator complaints (you file them)",
+};
+
+const SOURCE_LABELS: Record<string, string> = {
+  CUSTOMER_STATED: "you said it",
+  MERCHANT_STATED: "merchant said it",
+  COMPUTED: "computed by us",
+};
+
 export function CaseDetail({ id, nav }: { id: string; nav: (to: string) => void }) {
   const [d, setD] = useState<any>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -74,6 +89,23 @@ export function CaseDetail({ id, nav }: { id: string; nav: (to: string) => void 
             <div className="approval-card" key={a.id}>
               <div className="kind">Needs your decision · {a.kind.replace(/_/g, " ")}</div>
               <div className="summary">{a.summary}</div>
+              {a.detail?.payload?.draft && (
+                <details style={{ marginTop: 8 }}>
+                  <summary className="small" style={{ cursor: "pointer" }}>View the draft — you review and file it yourself</summary>
+                  <pre className="small" style={{ whiteSpace: "pre-wrap", maxHeight: 320, overflow: "auto", marginTop: 6 }}>{a.detail.payload.draft}</pre>
+                </details>
+              )}
+              {a.detail?.payload?.drafts && (
+                <details style={{ marginTop: 8 }}>
+                  <summary className="small" style={{ cursor: "pointer" }}>View the drafts — you review and file them yourself</summary>
+                  {(a.detail.payload.drafts as any[]).map((d2: any) => (
+                    <div key={d2.agency} style={{ marginTop: 8 }}>
+                      <div className="small"><strong>{d2.agency}</strong> — {d2.url}</div>
+                      <pre className="small" style={{ whiteSpace: "pre-wrap", maxHeight: 240, overflow: "auto" }}>{d2.body}</pre>
+                    </div>
+                  ))}
+                </details>
+              )}
               <div className="option-row">
                 {(a.options ?? []).map((o: any) => (
                   <button key={o.id} className={`btn btn-sm ${o.id === "accept" || o.id === "approve" || o.id === "received" ? "btn-primary" : ""}`}
@@ -193,6 +225,32 @@ export function CaseDetail({ id, nav }: { id: string; nav: (to: string) => void 
             </div>
           ))}
         </div>
+
+        <div className="card">
+          <div className="section-title" style={{ marginTop: 0 }}>Escalation</div>
+          {(d.escalations ?? []).length === 0 && (d.deadlines ?? []).length === 0 && (
+            <p className="muted small">Not escalated yet — the agent climbs this ladder only when the merchant deflects or denies.</p>
+          )}
+          {(d.escalations ?? []).map((e: any) => (
+            <div className="claim" key={e.id}>
+              <span className={`chip ${e.status === "executed" ? "chip-green" : e.status === "awaiting_approval" ? "chip-amber" : ""} st`}>
+                {e.status.replace(/_/g, " ")}
+              </span>
+              <span>Rung {e.rung} — {RUNG_LABELS[e.rung] ?? "—"}{e.note ? ` (${e.note})` : ""}</span>
+            </div>
+          ))}
+          {(d.deadlines ?? []).length > 0 && (
+            <>
+              <div className="section-title">Deadlines</div>
+              {(d.deadlines ?? []).map((dl: any) => (
+                <div className="claim" key={dl.id}>
+                  <span className={`chip ${dl.status === "missed" ? "chip-red" : dl.status === "met" ? "chip-green" : "chip-blue"} st`}>{dl.status}</span>
+                  <span>{dl.kind.replace(/_/g, " ")} — {dl.dueAt?.slice(0, 10)} · <em>{SOURCE_LABELS[dl.source] ?? dl.source}</em></span>
+                </div>
+              ))}
+            </>
+          )}
+        </div>
       </div>
 
       <div className="tabs" style={{ marginTop: 28 }}>
@@ -233,6 +291,9 @@ export function CaseDetail({ id, nav }: { id: string; nav: (to: string) => void 
 
       {tab === "evidence" && (
         <div>
+          <p className="small muted" style={{ margin: "0 0 10px" }}>
+            <a href={`/api/cases/${id}/bundle.pdf`} target="_blank" rel="noreferrer">Download the full evidence bundle (PDF)</a> — generated fresh from the case record.
+          </p>
           {(d.evidence ?? []).map((ev: any) => (
             <div className="evidence-item" key={ev.id}>
               <span className="kind">{ev.kind.replace(/_/g, " ")}</span>

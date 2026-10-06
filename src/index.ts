@@ -15,6 +15,9 @@ import { caseEvent, auditEvent } from "./core/events";
 import { cancelFollowUps, scheduleFollowUp } from "./core/followups";
 import { activateMandate, createMandate, getLatestMandate, revokeMandate } from "./core/mandate";
 import { latestOutcome } from "./core/outcomes";
+import { addDeadline } from "./core/escalation";
+import { gatherCaseFacts, renderBundleLines } from "./core/templates";
+import { buildPdf } from "./core/pdf";
 import { seedRegistry } from "./adapters/registry";
 import { extractMessageIds, resolveInboundCase } from "./email/threading";
 import PostalMime from "postal-mime";
@@ -225,6 +228,98 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
       const outcome = await advanceCase(env, caseId, "manual_run");
       return res(outcome);
     }
+    if (sub === "/deadlines" && req.method === "POST") {
+      // Customer-entered deadlines — always labeled CUSTOMER_STATED (R18).
+      const b = (await req.json()) as { kind?: string; dueAt?: string; note?: string };
+      const kind = b.kind ?? "";
+      if (!["promised_date", "return_window", "chargeback_window", "complaint_window"].includes(kind)) {
+        return err(400, "kind must be promised_date|return_window|chargeback_window|complaint_window");
+      }
+      const dueAt = b.dueAt ? new Date(b.dueAt) : null;
+      if (!dueAt || isNaN(dueAt.getTime())) return err(400, "dueAt must be a valid date");
+      const id = await addDeadline(env.DB, caseId, {
+        kind: kind as never,
+        dueAt: dueAt.toISOString(),
+        source: "CUSTOMER_STATED",
+        note: b.note?.slice(0, 200),
+      });
+      return res({ id });
+    }
+    if (sub === "/facts" && req.method === "POST") {
+      // Customer-entered case facts that templates consume (card type,
+      // statement date, return-window end). Stored on cases.meta; derived
+      // deadlines are labeled CUSTOMER_STATED.
+      const b = (await req.json()) as { cardType?: string; statementDate?: string; returnWindowEnd?: string };
+      const updates: string[] = [];
+      const binds: unknown[] = [];
+      if (b.cardType != null) {
+        if (!["credit", "debit", "unknown"].includes(b.cardType)) return err(400, "cardType must be credit|debit|unknown");
+        updates.push(`'$.cardType', ?`);
+        binds.push(b.cardType);
+      }
+      if (b.statementDate != null) {
+        const d = new Date(b.statementDate);
+        if (isNaN(d.getTime())) return err(400, "statementDate must be a valid date");
+        updates.push(`'$.statementDate', ?`);
+        binds.push(d.toISOString().slice(0, 10));
+      }
+      if (!updates.length && !b.returnWindowEnd) return err(400, "nothing to update");
+      if (updates.length) {
+        await run(
+          env.DB,
+          `UPDATE cases SET meta = json_set(COALESCE(meta,'{}'), ${updates.join(", ")}), updated_at = ? WHERE id = ?`,
+          ...binds,
+          nowIso(),
+          caseId,
+        );
+      }
+      const created: string[] = [];
+      if (b.statementDate) {
+        const id = await addDeadline(env.DB, caseId, {
+          kind: "chargeback_window",
+          dueAt: addMs(new Date(b.statementDate).toISOString(), 60 * 24 * 3600 * 1000),
+          source: "CUSTOMER_STATED",
+          note: "60 days from customer-stated statement date",
+        });
+        if (id) created.push(id);
+      }
+      if (b.returnWindowEnd) {
+        const d = new Date(b.returnWindowEnd);
+        if (isNaN(d.getTime())) return err(400, "returnWindowEnd must be a valid date");
+        const id = await addDeadline(env.DB, caseId, {
+          kind: "return_window",
+          dueAt: d.toISOString(),
+          source: "CUSTOMER_STATED",
+          note: "merchant return window end, per customer",
+        });
+        if (id) created.push(id);
+      }
+      await caseEvent(env.DB, caseId, "facts_updated", "customer", { cardType: b.cardType ?? null, statementDate: b.statementDate ?? null });
+      return res({ ok: true, deadlines: created });
+    }
+    if (sub === "/bundle.pdf" && req.method === "GET") {
+      const caseRow = await getCase(env.DB, caseId);
+      if (!caseRow) return err(404, "case not found");
+      const facts = await gatherCaseFacts(env.DB, caseRow);
+      const msgs = await q<{ direction: string; channel: string; subject: string; body: string; created_at: string }>(
+        env.DB,
+        `SELECT m.direction, c.channel, m.subject, m.body, m.created_at FROM external_messages m
+         JOIN external_conversations c ON c.id = m.conversation_id WHERE c.case_id = ? ORDER BY m.created_at ASC`,
+        caseId,
+      );
+      const pdf = buildPdf(
+        `Case ${caseId} evidence bundle`,
+        renderBundleLines(facts, msgs.map((m) => ({ direction: m.direction, channel: m.channel, subject: m.subject, body: m.body, at: m.created_at }))),
+      );
+      return new Response(pdf, {
+        headers: {
+          "Content-Type": "application/pdf",
+          "Content-Disposition": `attachment; filename="case-${caseId.slice(-8)}-evidence-bundle.pdf"`,
+          "X-Content-Type-Options": "nosniff",
+          "Cache-Control": "private, no-store",
+        },
+      });
+    }
     if (sub === "/message" && req.method === "POST") {
       const b = (await req.json()) as { text?: string };
       if (!b.text?.trim()) return err(400, "text required");
@@ -392,7 +487,7 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
 async function caseDetail(env: Env, caseId: string) {
   const c = await getCase(env.DB, caseId);
   const meta = json<{ orderRef?: string; trackingRef?: string; scenario?: string }>((c as Record<string, unknown> | null)?.meta as string | null, {});
-  const [claims, evidence, events, messages, mandate, outcome, approvals, actions, followups, costs] =
+  const [claims, evidence, events, messages, mandate, outcome, approvals, actions, followups, costs, escalations, deadlines] =
     await Promise.all([
       listClaims(env.DB, caseId),
       listEvidence(env.DB, caseId),
@@ -407,6 +502,8 @@ async function caseDetail(env: Env, caseId: string) {
       q(env.DB, `SELECT * FROM case_actions WHERE case_id = ? ORDER BY created_at ASC`, caseId),
       q(env.DB, `SELECT * FROM follow_ups WHERE case_id = ? ORDER BY due_at ASC`, caseId),
       q(env.DB, `SELECT kind, COUNT(*) n, SUM(cost_micro_usd) cost FROM cost_events WHERE case_id = ? GROUP BY kind`, caseId),
+      q(env.DB, `SELECT * FROM case_escalations WHERE case_id = ? ORDER BY rung ASC`, caseId),
+      q(env.DB, `SELECT * FROM case_deadlines WHERE case_id = ? ORDER BY due_at ASC`, caseId),
     ]);
   return {
     case: c,
@@ -427,6 +524,7 @@ async function caseDetail(env: Env, caseId: string) {
       id: r.id, kind: r.kind, summary: r.summary, status: r.status,
       options: json(r.options_json as string | null, []), createdAt: r.created_at,
       resolvedOption: r.resolved_option, resolvedAt: r.resolved_at,
+      detail: json(r.detail_json as string | null, {}),
     })),
     actions: actions.map((r: Record<string, unknown>) => ({
       id: r.id, kind: r.kind, policyClass: r.policy_class, status: r.status,
@@ -434,6 +532,14 @@ async function caseDetail(env: Env, caseId: string) {
     })),
     followUps: followups.map((r: Record<string, unknown>) => ({
       id: r.id, kind: r.kind, dueAt: r.due_at, status: r.status, firedAt: r.fired_at,
+    })),
+    escalations: escalations.map((r: Record<string, unknown>) => ({
+      id: r.id, rung: r.rung, actionId: r.action_id, status: r.status,
+      note: r.note, at: r.created_at,
+    })),
+    deadlines: deadlines.map((r: Record<string, unknown>) => ({
+      id: r.id, kind: r.kind, dueAt: r.due_at, source: r.source,
+      status: r.status, note: r.note, at: r.created_at,
     })),
     costs,
     ...(await assistedLane(env.DB, caseId)),
@@ -639,6 +745,12 @@ async function deleteAccount(env: Env, uid: string, sessionToken: string) {
   await del(`DELETE FROM outcome_events WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
   await del(`DELETE FROM case_events WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
   await del(`DELETE FROM cost_events WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
+  await del(`DELETE FROM case_escalations WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
+  await del(`DELETE FROM case_deadlines WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
+  await del(`DELETE FROM companion_pairings WHERE user_id = ?`);
+  await del(`DELETE FROM attestations WHERE user_id = ?`);
+  await del(`DELETE FROM billing_events WHERE user_id = ?`);
+  await del(`DELETE FROM fraud_signals WHERE user_id = ?`);
   await del(`DELETE FROM cases WHERE user_id = ?`);
   await del(`DELETE FROM connections WHERE user_id = ?`);
   await del(`DELETE FROM sessions WHERE user_id = ?`);

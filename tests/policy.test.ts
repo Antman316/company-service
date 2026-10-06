@@ -58,6 +58,29 @@ describe("policy engine (deterministic)", () => {
     expect(classifyAction({ kind: "teleport_refund" }, mandate).policyClass).toBe("UNSUPPORTED");
   });
 
+  it("always approval-gates rungs 5–6 drafts — no grant can unlock them (M3)", () => {
+    const everything = {
+      ...mandate,
+      authorized: [...mandate.authorized, "contact_executive", "draft_chargeback", "draft_complaint"],
+    };
+    for (const k of ["draft_chargeback", "draft_complaint"]) {
+      expect(classifyAction({ kind: k }, everything).policyClass).toBe("USER_APPROVAL_REQUIRED");
+    }
+  });
+
+  it("maps ladder rungs 1–4 to their mandate grants (M3)", () => {
+    const full = { ...mandate, authorized: [...mandate.authorized, "contact_executive"] };
+    expect(classifyAction({ kind: "escalate_policy_cite" }, full).policyClass).toBe("AUTO_ALLOWED");
+    expect(classifyAction({ kind: "escalate_request_human" }, full).policyClass).toBe("AUTO_ALLOWED");
+    expect(classifyAction({ kind: "escalate_supervisor" }, full).policyClass).toBe("AUTO_ALLOWED");
+    expect(classifyAction({ kind: "contact_executive" }, full).policyClass).toBe("AUTO_ALLOWED");
+
+    // Missing grants are hard-stops, never silent sends.
+    const narrow = { ...mandate, authorized: ["contact_company"] };
+    expect(classifyAction({ kind: "contact_executive" }, narrow).policyClass).toBe("PROHIBITED");
+    expect(classifyAction({ kind: "escalate_supervisor" }, narrow).policyClass).toBe("PROHIBITED");
+  });
+
   it("gates merchant offers through customer approval", () => {
     const partial = classifyMerchantOffer({ kind: "money", amountCents: 6000, requestedCents: 8417 }, mandate);
     expect(partial.policyClass).toBe("USER_APPROVAL_REQUIRED");
