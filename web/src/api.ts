@@ -66,6 +66,10 @@ export const api = {
     req("/api/connections", { method: "POST", body: JSON.stringify(b) }),
   removeConnection: (id: string) => req(`/api/connections/${id}`, { method: "DELETE" }),
   testConnection: (id: string) => req(`/api/connections/${id}/test`, { method: "POST" }),
+  companionPairings: () => req<{ pairings: any[] }>("/api/companion/pairings"),
+  companionCode: () => req<{ code: string; expiresInSeconds: number }>("/api/companion/code", { method: "POST" }),
+  companionRevoke: (pairingId: string) =>
+    req("/api/companion/revoke", { method: "POST", body: JSON.stringify({ pairingId }) }),
 
   coverage: () => req<{ companies: any[]; coverage: any[] }>("/api/coverage"),
   economics: () => req<any>("/api/economics"),

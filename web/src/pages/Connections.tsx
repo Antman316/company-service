@@ -13,6 +13,8 @@ const AUTOMATION_TONE: Record<string, string> = { SIMULATED: "amber", AUTOMATED:
 
 export function Connections() {
   const [conns, setConns] = useState<any[] | null>(null);
+  const [pairings, setPairings] = useState<any[] | null>(null);
+  const [pairCode, setPairCode] = useState<string | null>(null);
   const [cov, setCov] = useState<any>(null);
   const [provider, setProvider] = useState(PROVIDERS[0].id);
   const [vals, setVals] = useState<Record<string, string>>({});
@@ -21,6 +23,7 @@ export function Connections() {
 
   const load = useCallback(() => {
     api.connections().then((r) => setConns(r.connections)).catch(() => setConns([]));
+    api.companionPairings().then((r) => setPairings(r.pairings)).catch(() => setPairings([]));
     api.coverage().then(setCov).catch(() => null);
   }, []);
   useEffect(load, [load]);
@@ -89,6 +92,41 @@ export function Connections() {
             replies thread to your case automatically. Gmail send-only OAuth lands in V1.1.
           </p>
         </div>
+      </div>
+
+      <div className="card" style={{ marginTop: 16 }}>
+        <div className="section-title" style={{ marginTop: 0 }}>Chat companion</div>
+        <p className="small muted">
+          The Chrome extension assists you inside merchant support chats — it reads the chat you point it at,
+          shows the drafted reply, and never presses send. Pair by generating a short code here and entering it
+          in the extension's side panel.
+        </p>
+        <button className="btn btn-primary" onClick={async () => {
+          setErr(null); setMsg(null);
+          try {
+            const r = await api.companionCode();
+            setPairCode(r.code);
+            load();
+          } catch (e: any) { setErr(e.message); }
+        }}>Generate pairing code</button>
+        {pairCode && (
+          <div className="notice" style={{ marginTop: 10 }}>
+            Enter this code in the extension (15 minutes): <strong style={{ letterSpacing: "0.15em" }}>{pairCode}</strong>
+          </div>
+        )}
+        {(pairings ?? []).filter((x) => !x.revoked_at && x.label !== "pending").length > 0 && (
+          <div style={{ marginTop: 12 }}>
+            {(pairings ?? []).filter((x) => !x.revoked_at && x.label !== "pending").map((x) => (
+              <div className="evidence-item" key={x.id}>
+                <span style={{ flex: 1 }}>
+                  <strong>{x.label ?? "companion"}</strong>
+                  <span className="small muted" style={{ display: "block" }}>paired {String(x.created_at).slice(0, 10)}</span>
+                </span>
+                <button className="btn btn-sm btn-ghost" onClick={async () => { await api.companionRevoke(x.id); load(); }}>Revoke</button>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
       <div className="card" style={{ marginTop: 16 }}>
