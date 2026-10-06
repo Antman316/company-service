@@ -11,6 +11,7 @@ export async function scheduleFollowUp(
   kind: string,
   dueAt: string,
   payload: Record<string, unknown> = {},
+  env?: Env,
 ): Promise<string> {
   const id = newId("fup");
   await run(
@@ -23,6 +24,12 @@ export async function scheduleFollowUp(
     JSON.stringify(payload),
   );
   await caseEvent(db, caseId, "followup_scheduled", "system", { followUpId: id, kind, dueAt });
+  // M9: when a CASE_WORKFLOW binding exists, arm a durable instance that
+  // sleeps until due_at; the cron sweep remains the backstop either way.
+  if (env) {
+    const { armFollowUpWorkflow } = await import("./ops");
+    await armFollowUpWorkflow(env, id, caseId);
+  }
   return id;
 }
 
@@ -36,13 +43,18 @@ export async function dueFollowUps(db: D1Database, limit = 50) {
   );
 }
 
-export async function markFired(db: D1Database, id: string): Promise<void> {
-  await run(
+// Atomic claim: only transitions pending → fired, returns whether THIS
+// caller won. Lets the cron sweep and the per-case workflow run the same
+// schedule without double-firing (M9), and fixes the latent race where two
+// overlapping sweeps could both fire one follow-up.
+export async function markFired(db: D1Database, id: string): Promise<boolean> {
+  const r = await run(
     db,
-    `UPDATE follow_ups SET status = 'fired', fired_at = ?, attempt = attempt + 1 WHERE id = ?`,
+    `UPDATE follow_ups SET status = 'fired', fired_at = ?, attempt = attempt + 1 WHERE id = ? AND status = 'pending'`,
     nowIso(),
     id,
   );
+  return (r.meta?.changes ?? 0) > 0;
 }
 
 export async function cancelFollowUps(db: D1Database, caseId: string): Promise<void> {
