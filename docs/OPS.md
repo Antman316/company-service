@@ -66,11 +66,21 @@ A drill was performed on staging 2026-10-06 — see PR notes.
 
 ## Zone rate limiting
 
-WAF rate-limit rules on `/api/auth/*` and `/api/companion/*` are applied via
-the Cloudflare API (see the M9 PR for rule ids); layered on top of the
-in-worker counters (companion 120/min + 4000/day, abuse-report 5/day,
-10-case cap). On the Free zone plan the rate-limit ruleset may be capped —
-the in-worker counters are the guaranteed layer either way.
+Applied via the Cloudflare API (ruleset `66eb6bb8d05146c3999d530cd67d1256`,
+`http_ratelimit` phase). The Free zone plan caps this phase hard — exactly
+1 rule, period=10s, wildcard-only expressions, mitigation_timeout=10s — so
+the single live rule covers the most abuse-sensitive surface:
+
+- rule `571b1ce34e01453e959863048616499c` (`cs_auth_ratelimit`): block
+  `(http.host in {"company-service.agentmasterkey.com" "cs-staging.agentmasterkey.com"}
+   and http.request.uri.path wildcard "/api/auth/*")` at 4 req/10s per
+  ip.src+colo — ~24/min effective, still far below brute-force pace and
+  above real signup/signin/verify bursts. Host-scoped so nothing else on
+  the zone can trip it.
+
+`/api/companion/*` relies on the in-worker D1 counters (120/min +
+4000/day per case) alone. If the zone upgrades to a paid plan, add the
+companion rule (60 req/60s/IP) — the recipe is in the M9 PR notes.
 
 ## Status
 

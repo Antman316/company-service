@@ -161,9 +161,11 @@ elsewhere as built.
 
 - Rate limiting is layered: in-worker D1 counters (companion 120/min +
   4000/day per case, abuse-report 5/reporter/24h, 10 active cases/user)
-  plus zone WAF rate-limit rules on `/api/auth/*` and `/api/companion/*`
-  when the zone plan allows them (Free plan may cap rules — the D1
-  counters are the guaranteed layer either way).
+  plus ONE zone rate-limit rule live on prod: `/api/auth/*` blocked at
+  4 req/10s/IP (rule `571b1ce34e01453e959863048616499c`). The Free zone
+  plan caps this phase at 1 rule / period=10s / wildcard / timeout=10s —
+  `/api/companion/*` could not take the second rule and relies on the
+  in-worker counters alone.
 - Error responses don't leak internals. Observability (M9): every handler
   catch (`fetch`, `scheduled`, `email`, queue consumer, workflow arm/fire)
   calls `reportError` → `unhandled_error` audit + one alert email per
