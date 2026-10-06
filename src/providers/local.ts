@@ -6,6 +6,7 @@ import type {
   ProviderHealth,
 } from "../core/types";
 import { detectInjection } from "../security/injection";
+import { detectDeflection } from "../core/escalation";
 
 // ---------------------------------------------------------------------------
 // LOCAL DETERMINISTIC PROVIDER — development/test provider only.
@@ -112,6 +113,8 @@ function analyzeMerchant(text: string) {
   else if (/escalat|supervisor|manager|specialist/.test(lower)) intent = "escalation";
   else if (/receiv|got your|thank you for (contacting|reaching)|we('ll| will) (review|look)/.test(lower)) intent = "acknowledgment";
 
+  const defl = detectDeflection(text);
+
   return {
     intent,
     amountCents,
@@ -119,6 +122,8 @@ function analyzeMerchant(text: string) {
     offerKind: /store credit|gift card/.test(lower) ? "store_credit" : /replacement|exchange/.test(lower) ? "replacement" : amountCents != null ? "money" : null,
     injectionDetected: inj.detected,
     injectionMatches: inj.matches,
+    deflection: defl.deflection,
+    deflectionSignals: defl.signals,
     summary: text.slice(0, 280),
   };
 }
