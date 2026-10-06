@@ -27,6 +27,8 @@ export function CaseDetail({ id, nav }: { id: string; nav: (to: string) => void 
   const [tab, setTab] = useState<"timeline" | "messages" | "evidence">("timeline");
   const [note, setNote] = useState("");
   const [evText, setEvText] = useState("");
+  const [rcText, setRcText] = useState("");
+  const [rcAmount, setRcAmount] = useState("");
   const [replyText, setReplyText] = useState("");
   const [copied, setCopied] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
@@ -183,12 +185,56 @@ export function CaseDetail({ id, nav }: { id: string; nav: (to: string) => void 
           <div className="section-title" style={{ marginTop: 0 }}>Outcome — stated honestly</div>
           {d.outcome ? (
             <>
-              <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
                 <span className={`chip chip-${statusTone(d.outcome.status)}`}>{d.outcome.status.replace(/_/g, " ")}</span>
+                {d.receipt && d.receipt.tier !== "none" && (
+                  <span className={`chip ${d.receipt.tier === "verified_resolved" || d.receipt.tier === "document_verified" ? "chip-green" : "chip-blue"}`}>
+                    {d.receipt.tierLabel}
+                  </span>
+                )}
               </div>
               <p className="small" style={{ marginBottom: 0 }}>{d.outcome.detail}</p>
+              {d.receipt && d.receipt.tier !== "none" && d.receipt.tier !== "verified_resolved" && (
+                <p className="small muted" style={{ marginTop: 8, marginBottom: 0 }}>
+                  Add the refund-confirmation email or bank statement below to reach
+                  document-verified status — required for VERIFIED RESOLVED.
+                </p>
+              )}
             </>
           ) : <p className="muted small">No outcome recorded yet.</p>}
+        </div>
+
+        <div className="card">
+          <div className="section-title" style={{ marginTop: 0 }}>Refund confirmation — verify the money</div>
+          <p className="small muted" style={{ marginTop: 0 }}>
+            Paste the refund-confirmation email or attach the bank-statement entry.
+            A document on file is what turns "customer says it arrived" into a
+            verified result — it's what makes the outcome count.
+          </p>
+          {d.receipt && d.receipt.amountRecoveredCents > 0 && (
+            <p className="small" style={{ marginTop: 0 }}>
+              Recorded so far: <strong>${(d.receipt.amountRecoveredCents / 100).toFixed(2)}</strong>
+              {d.results?.amount_claimed ? ` of $${(d.results.amount_claimed / 100).toFixed(2)} claimed` : ""}
+            </p>
+          )}
+          <div className="field" style={{ marginBottom: 8 }}>
+            <textarea className="textarea" style={{ minHeight: 70 }} placeholder="Paste the refund-confirmation email text (e.g. 'Your refund of $84.17 was issued…')"
+              value={rcText} onChange={(e) => setRcText(e.target.value)} />
+          </div>
+          <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+            <input className="input" style={{ maxWidth: 140 }} inputMode="decimal" placeholder="Amount $" value={rcAmount}
+              onChange={(e) => setRcAmount(e.target.value)} />
+            <button className="btn btn-sm btn-primary" disabled={!rcText.trim() || busy === "rc"}
+              onClick={() => act("rc", async () => {
+                const amt = rcAmount ? Math.round(parseFloat(rcAmount.replace(/[$,]/g, "")) * 100) : undefined;
+                await api.receiptEvidence(id, { text: rcText, amountCents: Number.isFinite(amt) ? amt : undefined });
+                setRcText(""); setRcAmount("");
+              })}>
+              Add refund confirmation
+            </button>
+            {d.receipt && d.receipt.tier === "document_verified" && <span className="chip chip-green">document verified</span>}
+            {d.receipt && d.receipt.tier === "verified_resolved" && <span className="chip chip-green">verified resolved</span>}
+          </div>
         </div>
 
         <div className="card">

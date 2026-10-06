@@ -8,6 +8,7 @@ import { CaseDetail } from "./pages/CaseDetail";
 import { Approvals } from "./pages/Approvals";
 import { Connections } from "./pages/Connections";
 import { Economics } from "./pages/Economics";
+import { Results } from "./pages/Results";
 
 // Hash router — simplest reliable SPA routing behind static assets.
 export function useRoute(): [string, (to: string) => void] {
@@ -57,6 +58,7 @@ export function App() {
       case "/approvals": page = <Approvals nav={nav} onChanged={refreshMe} />; break;
       case "/connections": page = <Connections />; break;
       case "/economics": page = <Economics />; break;
+      case "/results": page = <Results />; break;
       default: page = <Dashboard nav={nav} me={me!} />;
     }
   }
@@ -76,6 +78,7 @@ export function App() {
             </a>
             <a href="#/connections" className={route === "/connections" ? "active" : ""}>Connections</a>
             <a href="#/economics" className={route === "/economics" ? "active" : ""}>Economics</a>
+            <a href="#/results" className={route === "/results" ? "active" : ""}>Results</a>
             <button className="btn btn-ghost btn-sm" onClick={async () => { await api.signout(); setCsrf(null); setMe(null); nav("/"); }}>
               Sign out
             </button>

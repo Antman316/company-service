@@ -11,6 +11,8 @@ interface Env {
   EMAIL_FROM?: string;
   /** Cloudflare Email Routing send_email binding — native outbound lane. */
   MAILOUT?: SendEmailBinding;
+  /** Comma-separated owner emails for /api/admin/results (plain_text var). */
+  ADMIN_EMAILS?: string;
 }
 
 // Minimal local declaration — full types live in the runtime.
