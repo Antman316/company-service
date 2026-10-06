@@ -1023,33 +1023,38 @@ async function deleteAccount(env: Env, uid: string, sessionToken: string) {
     );
     for (const k of keys) await env.EVIDENCE.delete(k.r2_key).catch(() => undefined);
   }
-  const del = async (sql: string) => run(env.DB, sql, uid);
-  await del(`DELETE FROM external_messages WHERE conversation_id IN (SELECT id FROM external_conversations WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?))`);
-  await del(`DELETE FROM external_conversations WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
-  await del(`DELETE FROM case_evidence WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
-  await del(`DELETE FROM case_claims WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
-  await del(`DELETE FROM case_actions WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
-  await del(`DELETE FROM case_plans WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
-  await del(`DELETE FROM case_mandates WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
-  await del(`DELETE FROM approval_requests WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
-  await del(`DELETE FROM follow_ups WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
-  await del(`DELETE FROM outcome_events WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
-  await del(`DELETE FROM case_events WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
-  await del(`DELETE FROM cost_events WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
-  await del(`DELETE FROM case_escalations WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
-  await del(`DELETE FROM case_deadlines WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
-  await del(`DELETE FROM companion_pairings WHERE user_id = ?`);
-  await del(`DELETE FROM attestations WHERE user_id = ?`);
-  await del(`DELETE FROM billing_events WHERE user_id = ?`);
-  await del(`DELETE FROM fraud_signals WHERE user_id = ?`);
-  await del(`DELETE FROM user_tokens WHERE user_id = ?`);
-  await del(`DELETE FROM notification_prefs WHERE user_id = ?`);
-  await del(`DELETE FROM password_resets WHERE user_id = ?`);
-  await del(`DELETE FROM cases WHERE user_id = ?`);
-  await del(`DELETE FROM connections WHERE user_id = ?`);
-  await del(`DELETE FROM sessions WHERE user_id = ?`);
-  await del(`DELETE FROM audit_events WHERE user_id = ?`);
-  await run(env.DB, `DELETE FROM users WHERE id = ?`, uid);
+  // All row deletes run as ONE D1 batch: atomic, so no in-flight write can
+  // insert a child row mid-sequence and break the FK ordering, and it's a
+  // single round trip instead of ~25.
+  const stmts = [
+    `DELETE FROM external_messages WHERE conversation_id IN (SELECT id FROM external_conversations WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?))`,
+    `DELETE FROM external_conversations WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`,
+    `DELETE FROM case_evidence WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`,
+    `DELETE FROM case_claims WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`,
+    `DELETE FROM case_actions WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`,
+    `DELETE FROM case_plans WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`,
+    `DELETE FROM case_mandates WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`,
+    `DELETE FROM approval_requests WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`,
+    `DELETE FROM follow_ups WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`,
+    `DELETE FROM outcome_events WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`,
+    `DELETE FROM case_events WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`,
+    `DELETE FROM cost_events WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`,
+    `DELETE FROM case_escalations WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`,
+    `DELETE FROM case_deadlines WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`,
+    `DELETE FROM companion_pairings WHERE user_id = ?`,
+    `DELETE FROM attestations WHERE user_id = ?`,
+    `DELETE FROM billing_events WHERE user_id = ?`,
+    `DELETE FROM fraud_signals WHERE user_id = ?`,
+    `DELETE FROM user_tokens WHERE user_id = ?`,
+    `DELETE FROM notification_prefs WHERE user_id = ?`,
+    `DELETE FROM password_resets WHERE user_id = ?`,
+    `DELETE FROM cases WHERE user_id = ?`,
+    `DELETE FROM connections WHERE user_id = ?`,
+    `DELETE FROM sessions WHERE user_id = ?`,
+    `DELETE FROM audit_events WHERE user_id = ?`,
+    `DELETE FROM users WHERE id = ?`,
+  ].map((sql) => env.DB.prepare(sql).bind(uid));
+  await env.DB.batch(stmts);
   void sessionToken;
 }
 

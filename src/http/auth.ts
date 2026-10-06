@@ -39,13 +39,17 @@ export async function signup(db: D1Database, email: string, password: string) {
   if (existing) return { ok: false as const, error: "account already exists" };
   const userId = newId("usr");
   const salt = newId("slt");
+  // OR IGNORE + re-check: email is UNIQUE; a duplicate signup between the
+  // check and insert must report "account already exists", not 500.
   await run(
     db,
-    `INSERT INTO users (id, email, password_hash) VALUES (?,?,?)`,
+    `INSERT OR IGNORE INTO users (id, email, password_hash) VALUES (?,?,?)`,
     userId,
     normalized,
     `${salt}:${await hashPassword(password, salt)}`,
   );
+  const inserted = await q1<{ id: string }>(db, `SELECT id FROM users WHERE email = ?`, normalized);
+  if (!inserted || inserted.id !== userId) return { ok: false as const, error: "account already exists" };
   return { ok: true as const, userId };
 }
 

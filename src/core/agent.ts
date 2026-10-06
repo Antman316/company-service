@@ -635,9 +635,11 @@ export async function recordMessage(
   const existing = await q1<{ id: string }>(db, `SELECT id FROM external_messages WHERE dedup_hash = ?`, dedup);
   if (existing) return { id: existing.id, duplicate: "content" };
   const id = newId("msg");
+  // OR IGNORE + re-read: same replica-lag race as proposeAction — a duplicate
+  // arriving between the check and the insert must be dedup'd, not 500'd.
   await run(
     db,
-    `INSERT INTO external_messages (id, conversation_id, direction, subject, body, meta_json, status, dedup_hash, external_id)
+    `INSERT OR IGNORE INTO external_messages (id, conversation_id, direction, subject, body, meta_json, status, dedup_hash, external_id)
      VALUES (?,?,?,?,?,?,?,?,?)`,
     id,
     conversationId,
@@ -649,7 +651,8 @@ export async function recordMessage(
     dedup,
     externalId ?? null,
   );
-  return { id, duplicate: null };
+  const row = await q1<{ id: string }>(db, `SELECT id FROM external_messages WHERE dedup_hash = ?`, dedup);
+  return { id: row?.id ?? id, duplicate: row && row.id !== id ? "content" : null };
 }
 
 // ---------------------------------------------------------------------------
