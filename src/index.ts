@@ -31,6 +31,7 @@ import {
   totpConfirm, totpDisable, totpEnroll, verifyEmailLink,
 } from "./http/account";
 import { sendVerificationEmail, sendSystemEmail } from "./core/notify";
+import { healthCheckDue, runDirectoryHealthCheck } from "./adapters/directory";
 import { activeCaseCount, MAX_ACTIVE_CASES_PER_USER, recordFraudSignal } from "./core/abuse";
 import { STATIC_FILES } from "./static";
 
@@ -1093,7 +1094,18 @@ export default {
 
   // Durable follow-up sweep — the "customer never has to remember" engine.
   async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(runFollowUpSweep(env).then((r) => console.log(`[sweep] fired=${r.fired}`)));
+    ctx.waitUntil(
+      (async () => {
+        const r = await runFollowUpSweep(env);
+        console.log(`[sweep] fired=${r.fired}`);
+        // M6 monthly lane-health check — gated to once per 30 days inside the
+        // 5-min sweep.
+        if (await healthCheckDue(env.DB)) {
+          const h = await runDirectoryHealthCheck(env);
+          console.log(`[healthcheck] checked=${h.checked} degraded=${h.degraded}`);
+        }
+      })(),
+    );
   },
 
   // Inbound email via Cloudflare Email Routing (real public route — a literal
