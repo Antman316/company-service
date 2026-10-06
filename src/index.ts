@@ -23,6 +23,7 @@ import { extractMessageIds, resolveInboundCase } from "./email/threading";
 import PostalMime from "postal-mime";
 import { encryptJson } from "./security/crypto";
 import { getSession, requireCsrf, signin, signout, signup } from "./http/auth";
+import { handleCompanion } from "./http/companion";
 import { STATIC_FILES } from "./static";
 
 // --------------------------------------------------------------------------
@@ -60,6 +61,12 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
     return res({ ok: true, csrf: s.csrf }, { headers: { "Set-Cookie": s.cookie } });
   }
   if (path === "/api/health") return res({ ok: true, service: "company-service", time: nowIso() });
+
+  // Chat-companion routes have their own auth (bearer pairing tokens for the
+  // extension; session+CSRF for management) and must run before the global
+  // session gate. Returns null when the path isn't /api/companion*.
+  const companionRes = await handleCompanion(req, env, url, ctx.session);
+  if (companionRes) return companionRes;
 
   const session = ctx.session;
   if (!session) return err(401, "not signed in");
@@ -712,13 +719,23 @@ async function exportAccount(env: Env, uid: string) {
     ["follow_ups", `SELECT f.* FROM follow_ups f JOIN cases c ON c.id = f.case_id WHERE c.user_id = ?`],
     ["case_actions", `SELECT * FROM case_actions WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`],
     ["case_plans", `SELECT * FROM case_plans WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`],
+    ["case_escalations", `SELECT * FROM case_escalations WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`],
+    ["case_deadlines", `SELECT * FROM case_deadlines WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`],
+    ["attestations", `SELECT * FROM attestations WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`],
+    ["billing_events", `SELECT * FROM billing_events WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`],
+    ["companion_pairings", `SELECT id, user_id, label, created_at, revoked_at FROM companion_pairings WHERE user_id = ?`],
     ["connections", `SELECT id, type, provider, label, status, meta, created_at FROM connections WHERE user_id = ?`],
   ];
   const out: Record<string, unknown> = {
     exportedAt: nowIso(),
     user: await q1(env.DB, `SELECT id, email, created_at FROM users WHERE id = ?`, uid),
   };
-  for (const [name, sql] of tables) out[name] = await q(env.DB, sql, uid);
+  // Tolerate databases missing optional V1 tables (additive migrations are
+  // applied per-environment): a missing table exports as [] rather than 500ing
+  // the whole export.
+  for (const [name, sql] of tables) {
+    out[name] = await q(env.DB, sql, uid).catch(() => []);
+  }
   return out;
 }
 

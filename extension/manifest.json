@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "Company Service Companion",
+  "version": "0.1.0",
+  "description": "Assists you in merchant support chats — drafts replies, watches for deflection, captures the transcript. You always press send.",
+  "permissions": ["sidePanel", "activeTab", "storage", "tabs", "scripting"],
+  "host_permissions": [
+    "https://company-service.agentmasterkey.com/*",
+    "https://cs-staging.agentmasterkey.com/*",
+    "*://*.liveperson.net/*",
+    "*://*.salesforceliveagent.com/*",
+    "*://*.zendesk.com/*",
+    "*://*.zdassets.com/*",
+    "*://*.sprinklr.com/*",
+    "*://*.kustomerapp.com/*",
+    "*://*.genesys.com/*",
+    "*://*.livechatinc.com/*",
+    "*://*.tawk.to/*"
+  ],
+  "background": { "service_worker": "background.js" },
+  "side_panel": { "default_path": "sidepanel.html" },
+  "action": { "default_title": "Company Service Companion" },
+  "content_security_policy": { "extension_pages": "script-src 'self'; object-src 'self'" }
+}
