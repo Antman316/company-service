@@ -913,7 +913,7 @@ export async function ingestInboundEmail(
           senderEmail,
         )
       : null;
-    if (sender?.email_verified_at) {
+    if (sender?.email_verified_at && senderEmail) {
       const { caseId: newId2 } = await createCaseFromText(
         env, sender.id,
         `${parsed.subject ? `Fwd: ${parsed.subject}\n\n` : ""}${parsed.body}`.slice(0, 8000),
