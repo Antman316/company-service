@@ -33,6 +33,10 @@ export interface LaunchMerchant {
   quotes: string[];
   /** Official source URL(s) where the channels were confirmed. */
   sources: string[];
+  /** Coverage-row id reuse for the email lane when a VERIFIED row already
+   *  exists under a pre-M6 id — preserves its real verification timestamp
+   *  instead of minting a fresh row (chewy's prod email lane). */
+  legacyEmailCovId?: string;
 }
 
 export const LAUNCH_MERCHANTS: LaunchMerchant[] = [
@@ -108,6 +112,9 @@ export const LAUNCH_MERCHANTS: LaunchMerchant[] = [
   },
   {
     id: "cmp_chewy", name: "Chewy", domains: ["chewy.com"],
+    // The VERIFIED lane lives under the pre-M6 id — reusing it keeps the
+    // original prod verification timestamp instead of minting a fresh row.
+    legacyEmailCovId: "cov_chewy_email",
     email: "service@chewy.com", form: null,
     chat: "https://www.chewy.com/app/content/contact",
     alt: "24/7 phone 1-800-672-4399",
@@ -356,7 +363,7 @@ export async function seedDirectory(db: D1Database): Promise<void> {
     if (m.email) {
       await covStmt
         .bind(
-          `cov_${m.id}_email`,
+          m.legacyEmailCovId ?? `cov_${m.id}_email`,
           m.id,
           "any",
           "email",
@@ -428,6 +435,18 @@ export async function seedDirectory(db: D1Database): Promise<void> {
         .run();
     }
   }
+
+  // Idempotent cleanup of rows superseded by this directory:
+  //  - cov_cmp_chewy_email — the duplicate this seed wrote before chewy's
+  //    lane was bound to the legacy VERIFIED id (cov_chewy_email wins).
+  //  - cov_cmp_{amazon,walmart,target}_assist — old guessed chat lanes
+  //    (verification_status 'ASSISTED') superseded by *_chat
+  //    CONTACT_CONFIRMED rows carrying audited official sources.
+  await run(
+    db,
+    `DELETE FROM company_coverage WHERE id IN
+      ('cov_cmp_chewy_email','cov_cmp_amazon_assist','cov_cmp_walmart_assist','cov_cmp_target_assist')`,
+  );
 }
 
 // ---------------------------------------------------------------------------
