@@ -5,16 +5,32 @@ elsewhere as built.
 
 ## Merchant coverage
 
-- **First real merchant lane: Chewy + US + email** — `service@chewy.com`
-  (official published support email). VERIFIED for initiating contact:
-  real outbound mail sent through `cloudflare_send_email` (prod case
-  `case_muunvdukh1f5pmklq3`, 2026-10-05). Replies ingest through the
-  live Email Routing lane (inbound verified separately). Does NOT imply
-  account access, order data, or guaranteed outcomes — those stay
-  MANUAL. Everything else → `UNSUPPORTED` + manual handoff.
-- Test Merchant remains SIMULATED; Amazon/Walmart/Target **chat** is
-  ASSISTED (lane VERIFIED on prod; merchant contact itself not proven);
-  Amazon email/portal remains UNVERIFIED.
+- **25-merchant launch directory (M6) IMPLEMENTED** — every launch merchant
+  has a `companies` row, a MANUAL_HANDOFF floor lane, per-channel coverage
+  lanes, and a `merchant_playbooks` row. Per the channel audit
+  (`MERCHANT_CHANNEL_AUDIT.md`): 4 publish a support email (Chewy, Zappos,
+  Sephora, Shein), 5 publish a web form, 24 publish a chat lane. Every lane
+  address carries its official-source URL in `notes`.
+- **Lane labels are honest:** `CONTACT_CONFIRMED` = the channel is
+  confirmed on the merchant's official site but no real customer case has
+  used it yet. `VERIFIED` = a real merchant reply was observed through
+  that lane (promoted automatically from CONTACT_CONFIRMED/UNVERIFIED when
+  a reply lands — never downgraded). Today only **Chewy + email** is
+  VERIFIED (real outbound mail `service@chewy.com`, prod case
+  `case_muunvdukh1f5pmklq3`, 2026-10-05). Ship gate ≥15 VERIFIED lanes is
+  **NOT MET** — it requires real cases, not seeding.
+- **SIMULATED lanes (Test Merchant) can never become VERIFIED** — sim
+  traffic is not real contact; the promotion only upgrades
+  CONTACT_CONFIRMED/UNVERIFIED rows.
+- **Monthly lane-health check IMPLEMENTED, UNVERIFIED** — the 5-min sweep
+  runs `runDirectoryHealthCheck` at most once per 30 days: email lanes
+  degrade on `send_bounced`/`delivery_failed` audit rows in the last 30d;
+  chat/form lanes degrade when the official URL stops answering. Flips
+  write `lane_health_change` audits. UNVERIFIED: the first real monthly
+  run has not happened yet.
+- Playbook fields `executive_contact`, `policy_quotes`, `chat_selectors`
+  start empty/null per lane — nothing is fabricated; verified contacts
+  land in playbooks as real cases produce them.
 - No autonomous browser/chat automation — ASSISTED is the shipped lane
   (see BROWSER_ARCHITECTURE). No CAPTCHA bypass, no credential storage.
 

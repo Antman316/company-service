@@ -1,4 +1,5 @@
 import { q, q1 } from "../core/db";
+import { seedDirectory } from "./directory";
 import type {
   CompanyAdapter,
   CoverageQuery,
@@ -49,16 +50,21 @@ interface CompanyRow {
 }
 
 export async function findCompany(db: D1Database, name: string): Promise<CompanyRow | null> {
-  const norm = name.trim().toLowerCase();
+  // Punctuation-insensitive so "Lowes"/"Lowe's" and "Macys"/"Macy's" match.
+  const norm = name.trim().toLowerCase().replace(/[^a-z0-9]/g, "");
   const rows = await q<CompanyRow>(db, `SELECT * FROM companies`);
   return (
     rows.find(
-      (c) =>
-        c.name.toLowerCase() === norm ||
-        // Loose substring matching only for non-trivial names — otherwise "a"
-        // or "on" would match every company and fabricate coverage.
-        (norm.length >= 3 && c.name.toLowerCase().includes(norm)) ||
-        norm.includes(c.name.toLowerCase()),
+      (c) => {
+        const cn = c.name.toLowerCase().replace(/[^a-z0-9]/g, "");
+        return (
+          cn === norm ||
+          // Loose substring matching only for non-trivial names — otherwise "a"
+          // or "on" would match every company and fabricate coverage.
+          (norm.length >= 3 && cn.includes(norm)) ||
+          norm.includes(cn)
+        );
+      },
     ) ?? null
   );
 }
@@ -66,7 +72,7 @@ export async function findCompany(db: D1Database, name: string): Promise<Company
 // Resolve the best supported route for a case. Route priority per spec:
 // official API > authorized MCP > protocol > email > browser > computer use >
 // manual handoff.
-const ROUTE_PRIORITY = ["api", "mcp", "protocol", "email", "chat", "computer", "manual"];
+const ROUTE_PRIORITY = ["api", "mcp", "protocol", "email", "chat", "form", "computer", "manual"];
 
 export async function checkCoverage(
   db: D1Database,
@@ -279,4 +285,8 @@ export async function seedRegistry(db: D1Database): Promise<void> {
       )
       .run();
   }
+
+  // M6 — the 25-merchant launch directory (companies + per-channel coverage
+  // + playbooks). Idempotent INSERT OR IGNORE per row, same as above.
+  await seedDirectory(db);
 }

@@ -692,6 +692,35 @@ export async function ingestMerchantMessage(
     });
   }
   await caseEvent(db, caseRow.id, "message_received", "merchant", { preview: body.slice(0, 200), duplicate: stored.duplicate === "content" });
+
+  // M6 honest labels: a merchant reply observed on this lane promotes the
+  // company's matching coverage row to VERIFIED. Promotion is only allowed
+  // from CONTACT_CONFIRMED/UNVERIFIED — SIMULATED (test-merchant) lanes can
+  // never become VERIFIED, since sim traffic is not real contact.
+  const conv = await q1<{ channel: string }>(
+    db,
+    `SELECT channel FROM external_conversations WHERE id = ?`,
+    conversationId,
+  );
+  if (conv && caseRow.company_id) {
+    const promoted = await run(
+      db,
+      `UPDATE company_coverage SET verification_status = 'VERIFIED', last_verified_at = ?
+        WHERE company_id = ? AND channel = ? AND verification_status IN ('CONTACT_CONFIRMED','UNVERIFIED')`,
+      nowIso(),
+      caseRow.company_id,
+      conv.channel,
+    );
+    if (promoted.meta?.changes) {
+      await auditEvent(db, {
+        type: "lane_verified",
+        severity: "info",
+        caseId: caseRow.id,
+        data: { companyId: caseRow.company_id, channel: conv.channel },
+      });
+    }
+  }
+
   await notify(env, caseRow.user_id, "merchant_replied", {
     caseId: caseRow.id,
     subject: `${caseRow.company_name ?? "The company"} replied`,
