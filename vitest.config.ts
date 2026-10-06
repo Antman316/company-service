@@ -18,6 +18,10 @@ export default defineWorkersConfig({
       },
     },
     setupFiles: ["./tests/setup.ts"],
+    // Test files share one in-memory D1 (isolatedStorage is off above), so
+    // parallel files contend on the same sqlite — serial files keep runs
+    // deterministic at the cost of a few extra seconds.
+    fileParallelism: false,
     testTimeout: 30000,
   },
 });

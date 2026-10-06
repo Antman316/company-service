@@ -1,5 +1,6 @@
 import { json, newId, nowIso, q, q1, run } from "./db";
 import { caseEvent } from "./events";
+import { notify } from "./notify";
 import type { ApprovalOption } from "./types";
 
 export interface ApprovalRequestRow {
@@ -18,7 +19,7 @@ export interface ApprovalRequestRow {
 }
 
 export async function createApproval(
-  db: D1Database,
+  env: Env,
   caseId: string,
   opts: {
     actionId?: string;
@@ -28,6 +29,7 @@ export async function createApproval(
     options: ApprovalOption[];
   },
 ): Promise<string> {
+  const db = env.DB;
   const id = newId("apr");
   await run(
     db,
@@ -46,6 +48,17 @@ export async function createApproval(
     kind: opts.kind,
     summary: opts.summary,
   });
+  // M7: email the customer that a decision is waiting (preference-gated).
+  const caseRow = await q1<{ user_id: string; company_name: string | null }>(
+    db, `SELECT user_id, company_name FROM cases WHERE id = ?`, caseId,
+  );
+  if (caseRow) {
+    await notify(env, caseRow.user_id, "approval_needed", {
+      caseId,
+      subject: `Company Service needs your decision${caseRow.company_name ? ` — ${caseRow.company_name}` : ""}`,
+      body: `${opts.summary}\n\nOpen the app to review and decide.`,
+    }).catch(() => {});
+  }
   return id;
 }
 

@@ -12,7 +12,7 @@ export async function signup(email: string, password = "password-1234"): Promise
   const r = await SELF.fetch("http://test/api/auth/signup", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email, password }),
+    body: JSON.stringify({ email, password, consent: true }),
   });
   if (!r.ok) throw new Error(`signup failed: ${r.status} ${await r.text()}`);
   const setCookie = r.headers.get("set-cookie") ?? "";

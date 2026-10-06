@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState, type ReactElement } from "react";
-import { api, setCsrf } from "./api";
+import { api, setCsrf, type MeUser } from "./api";
 import { Landing } from "./pages/Landing";
 import { Auth } from "./pages/Auth";
 import { Dashboard } from "./pages/Dashboard";
@@ -9,6 +9,7 @@ import { Approvals } from "./pages/Approvals";
 import { Connections } from "./pages/Connections";
 import { Economics } from "./pages/Economics";
 import { Results } from "./pages/Results";
+import { Terms, Privacy, HowItWorks, Disclaimer, VerifyResult, ReportAbuse } from "./pages/Legal";
 
 // Hash router — simplest reliable SPA routing behind static assets.
 export function useRoute(): [string, (to: string) => void] {
@@ -24,7 +25,7 @@ export function useRoute(): [string, (to: string) => void] {
 
 export function App() {
   const [route, nav] = useRoute();
-  const [me, setMe] = useState<{ id: string; email: string } | null | undefined>(undefined);
+  const [me, setMe] = useState<MeUser | null | undefined>(undefined);
   const [pending, setPending] = useState(0);
 
   const refreshMe = useCallback(async () => {
@@ -44,11 +45,20 @@ export function App() {
   useEffect(() => { refreshMe(); }, [refreshMe, route]);
 
   const authed = !!me;
+  const base = route.split("?")[0];
 
-  // Route resolution.
+  // Route resolution — legal/trust pages are public, before the auth gate.
   let page: ReactElement;
-  if (!authed) {
-    if (route === "/auth") page = <Auth onDone={refreshMe} />;
+  if (base === "/terms") page = <Terms />;
+  else if (base === "/privacy") page = <Privacy />;
+  else if (base === "/how") page = <HowItWorks />;
+  else if (base === "/disclaimer") page = <Disclaimer />;
+  else if (base === "/verified") page = <VerifyResult ok />;
+  else if (base === "/verify-failed") page = <VerifyResult ok={false} />;
+  else if (base === "/report") page = <ReportAbuse />;
+  else if (!authed) {
+    if (base === "/reset") page = <Auth onDone={refreshMe} initialMode="resetConfirm" />;
+    else if (base === "/auth") page = <Auth onDone={refreshMe} />;
     else page = <Landing onCta={() => nav("/auth")} />;
   } else if (route.startsWith("/case/")) {
     page = <CaseDetail id={route.slice(6)} nav={nav} />;
@@ -89,7 +99,46 @@ export function App() {
           </nav>
         )}
       </header>
-      {me === undefined ? <div className="page"><span className="spinner" /></div> : page}
+      {me === undefined ? <div className="page"><span className="spinner" /></div> : (
+        <>
+          {authed && me && !me.emailVerified && base !== "/verified" && (
+            <VerifyBanner />
+          )}
+          {page}
+        </>
+      )}
+      <SiteFooter />
     </>
+  );
+}
+
+function VerifyBanner() {
+  const [sent, setSent] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  return (
+    <div className="page" style={{ paddingBottom: 0 }}>
+      <div className="verify-banner">
+        <span><strong>Verify your email.</strong> Outbound sends to merchants and platform models stay off until you do.</span>
+        {sent
+          ? <span className="small">Sent — check your inbox.</span>
+          : <button className="btn btn-sm btn-primary" onClick={async () => {
+              try { await api.resendVerification(); setSent(true); }
+              catch (e: any) { setErr(e.message); }
+            }}>Resend verification email</button>}
+        {err && <span className="small" style={{ color: "var(--red)" }}>{err}</span>}
+      </div>
+    </div>
+  );
+}
+
+function SiteFooter() {
+  return (
+    <footer className="site-footer">
+      <a href="#/how">How it works</a>
+      <a href="#/terms">Terms</a>
+      <a href="#/privacy">Privacy</a>
+      <a href="#/disclaimer">Not legal advice</a>
+      <a href="#/report">Report abuse</a>
+    </footer>
   );
 }
