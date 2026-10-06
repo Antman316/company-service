@@ -35,6 +35,9 @@ export function NewCase({ nav }: { nav: (to: string) => void }) {
   const [created, setCreated] = useState<{ caseId: string; objective: any; suggestedMandate: any } | null>(null);
   const [grants, setGrants] = useState<Record<string, boolean>>({});
   const [gate, setGate] = useState<Record<string, boolean>>({});
+  const [daysOverdue, setDaysOverdue] = useState("");
+  const [priorAttempts, setPriorAttempts] = useState("");
+  const [refundInProgress, setRefundInProgress] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -43,7 +46,11 @@ export function NewCase({ nav }: { nav: (to: string) => void }) {
   async function create() {
     setBusy(true); setErr(null);
     try {
-      const r = await api.createCase(text, usesSim ? scenario : undefined);
+      const startingState: any = {};
+      if (daysOverdue) startingState.daysOverdue = Number(daysOverdue);
+      if (priorAttempts) startingState.priorAttempts = Number(priorAttempts);
+      if (refundInProgress) startingState.refundInProgress = true;
+      const r = await api.createCase(text, usesSim ? scenario : undefined, startingState);
       setCreated(r);
       const g: Record<string, boolean> = {};
       for (const a of (r.suggestedMandate?.authorized ?? [])) g[a] = true;
@@ -98,11 +105,35 @@ export function NewCase({ nav }: { nav: (to: string) => void }) {
                   <option value="evidence_request">Requests evidence</option>
                   <option value="delayed">Says "respond tomorrow"</option>
                   <option value="escalation">Requires escalation</option>
+                  <option value="deflection">Deflects twice, then resolves (empathy, no action)</option>
+                  <option value="stonewall">Stonewalls forever (drives the escalation ladder)</option>
                   <option value="injection">Attempts prompt injection</option>
                 </select>
               </div>
             </div>
           )}
+          <details style={{ marginTop: 18 }}>
+            <summary className="small muted" style={{ cursor: "pointer" }}>
+              Optional: what already happened before this (helps us report what we actually added)
+            </summary>
+            <div className="grid grid-3" style={{ marginTop: 10 }}>
+              <div className="field">
+                <label>Days since refund was owed</label>
+                <input className="input" inputMode="numeric" placeholder="e.g. 21" value={daysOverdue} onChange={(e) => setDaysOverdue(e.target.value)} />
+              </div>
+              <div className="field">
+                <label>Times you already asked</label>
+                <input className="input" inputMode="numeric" placeholder="e.g. 2" value={priorAttempts} onChange={(e) => setPriorAttempts(e.target.value)} />
+              </div>
+              <div className="field">
+                <label>&nbsp;</label>
+                <label className="small" style={{ display: "flex", gap: 8, alignItems: "center", fontWeight: 500 }}>
+                  <input type="checkbox" checked={refundInProgress} onChange={(e) => setRefundInProgress(e.target.checked)} />
+                  Refund already in progress
+                </label>
+              </div>
+            </div>
+          </details>
           <div style={{ marginTop: 20, display: "flex", justifyContent: "flex-end", gap: 10 }}>
             {err && <span className="error-box" style={{ margin: 0, flex: 1 }}>{err}</span>}
             <button className="btn btn-primary" disabled={text.trim().length < 10 || busy} onClick={create}>

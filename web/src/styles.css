@@ -261,3 +261,10 @@ input, textarea, select { font: inherit; color: inherit; }
   .hero { padding: 48px 16px 40px; }
   .how { padding: 0 16px 48px; }
 }
+
+/* ---------- results table (M4) ---------- */
+.tbl { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+.tbl th { text-align: left; font-size: 11.5px; text-transform: uppercase; letter-spacing: .08em; color: var(--ink-3); font-weight: 650; padding: 6px 10px 8px; border-bottom: 1px solid var(--line); }
+.tbl td { padding: 9px 10px; border-bottom: 1px solid var(--line); }
+.tbl tr:last-child td { border-bottom: none; }
+.tbl td:not(:first-child), .tbl th:not(:first-child) { text-align: right; }

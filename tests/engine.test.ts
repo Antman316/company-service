@@ -77,12 +77,25 @@ describe("Scenario A — refund follow-up (VERIFIED path)", () => {
     expect(receiptApproval).toBeTruthy();
     expect(d.outcome.status).toBe("ISSUED");
 
-    // Customer confirms receipt → VERIFIED_RESOLVED + RESOLVED.
+    // M4: customer confirms receipt → RECEIVED (CUSTOMER_CONFIRMED) only —
+    // self-report is never the top tier. A verify_receipt approval follows.
     const r = await apiPost(c, `/api/approvals/${receiptApproval.id}/decide`, { optionId: "received" });
     expect(r.status).toBe(200);
     d = await getCaseDetail(c, caseId);
+    expect(d.outcome.status).toBe("RECEIVED");
+    expect(d.outcome.evidence_note).toMatch(/^customer_confirmed/);
+    expect(d.case.status).not.toBe("RESOLVED");
+    const verifyApproval = d.approvals.find((a: any) => a.kind === "verify_receipt" && a.status === "pending");
+    expect(verifyApproval).toBeTruthy();
+
+    // Closing without a document → RESOLVED at customer-confirmed tier, still
+    // not VERIFIED_RESOLVED.
+    await apiPost(c, `/api/approvals/${verifyApproval.id}/decide`, { optionId: "close" });
+    d = await getCaseDetail(c, caseId);
     expect(d.case.status).toBe("RESOLVED");
-    expect(d.outcome.status).toBe("VERIFIED_RESOLVED");
+    expect(d.outcome.status).toBe("RECEIVED");
+    expect(d.receipt.tier).toBe("customer_confirmed");
+    expect(d.results.amount_recovered).toBe(8417);
   });
 });
 
