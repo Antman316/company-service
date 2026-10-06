@@ -159,6 +159,34 @@ elsewhere as built.
 
 ## Security
 
-- Rate limiting is basic D1 counters.
-- Error responses don't leak internals, but observability is `console.error`
-  + `audit_events` — no Sentry/Logpush wired yet (`logpush: false`).
+- Rate limiting is layered: in-worker D1 counters (companion 120/min +
+  4000/day per case, abuse-report 5/reporter/24h, 10 active cases/user)
+  plus zone WAF rate-limit rules on `/api/auth/*` and `/api/companion/*`
+  when the zone plan allows them (Free plan may cap rules — the D1
+  counters are the guaranteed layer either way).
+- Error responses don't leak internals. Observability (M9): every handler
+  catch (`fetch`, `scheduled`, `email`, queue consumer, workflow arm/fire)
+  calls `reportError` → `unhandled_error` audit + one alert email per
+  error-signature/hour to `OPS_ALERT_EMAIL` (default
+  admin@agentmasterkey.com) via MAILOUT. Sentry remains NOT IMPLEMENTED —
+  needs an account + DSN.
+
+## Ops & reliability (M9)
+
+- Inbound email bursts are buffered through the `cs-inbound` queue: the
+  raw MIME lands in R2 (`inbound-raw/`) and the `queue()` consumer runs
+  the full ingest pipeline with retries (3). Cheap checks (domain, dedup,
+  case resolution) stay synchronous so unknown mail still bounces. Without
+  the queue binding the handler falls back to synchronous ingest — same
+  pipeline, no behavior change.
+- Long-running follow-ups run as Cloudflare Workflows instances
+  (`CASE_WORKFLOW` → `CaseWorkflow`, one per follow-up, sleeps until
+  `due_at`). The 5-minute cron sweep stays as backstop; `markFired` is an
+  atomic pending→fired claim so whichever path fires first wins. Without
+  the binding (local dev, tests) only the cron path exists — same rows.
+- Daily D1 backup to R2 (`backups/<date>/*.jsonl` + `manifest.json`,
+  30-day retention) runs inside the cron sweep; restore drill is
+  documented in `docs/OPS.md`. IMPLEMENTED, drill pending on staging.
+- Mission Control status row exists (unchanged).
+- `logpush` still not wired; Workers Assets SPA move remains a
+  nice-to-have pending a credential with assets-upload rights.

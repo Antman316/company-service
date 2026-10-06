@@ -22,6 +22,14 @@ interface Env {
   CASE_SPEND_CAP_MICRO_USD?: string;
   USER_DAILY_SPEND_CAP_MICRO_USD?: string;
   GLOBAL_DAILY_SPEND_CAP_MICRO_USD?: string;
+  /** M9: inbound-burst queue producer (queue consumer = queue() handler). */
+  INBOUND_Q?: Queue<import("./core/ops").InboundQueueMessage>;
+  /** M9: durable per-follow-up workflow (CaseWorkflow); cron sweep is the backstop. */
+  CASE_WORKFLOW?: Workflow<{ followUpId: string; caseId: string }>;
+  /** M9 ops alerts recipient (defaults to admin@agentmasterkey.com). */
+  OPS_ALERT_EMAIL?: string;
+  /** M9 backup retention in days (default 30). */
+  BACKUP_RETENTION_DAYS?: string;
 }
 
 // Minimal local declaration — full types live in the runtime.
