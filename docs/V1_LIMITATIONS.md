@@ -77,6 +77,17 @@ elsewhere as built.
   letter is not legal advice and is labeled as such.
 - Case deadlines are source-labeled (CUSTOMER_STATED / MERCHANT_STATED /
   COMPUTED); the chargeback window needs a customer-entered statement date.
+- **Chat companion (M5) IMPLEMENTED, NOT VERIFIED on real merchant chats.** The
+  Chrome MV3 extension (`extension/`) pairs via short code → scoped revocable
+  bearer token (`companion_pairings`), prefilters tabs against the domain
+  allowlist fetched from `/api/companion/domains` (no calls leave for other
+  sites), watches a user-picked region text-only, and streams observed text to
+  the same UNTRUSTED ingest as pasted replies. It can fill the chat input but
+  **never presses send**. Per-merchant selector configs are deferred — generic
+  mode is the shipped mode. The spec's acceptance (3 real merchant chats on
+  video) requires real customer accounts and is not yet met.
+- Companion endpoints are rate-limited per pairing (120/min, 4000/day, counted
+  from the audit trail) and every call writes an audit event.
 - No 2FA, no email verification, no password reset.
 - ~~Export/delete-account endpoints not shipped~~ — **done**:
   `/api/account/export` (13-table dump) + `/api/account/delete`
