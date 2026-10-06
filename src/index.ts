@@ -7,7 +7,7 @@ import {
   runFollowUpSweep,
   suggestedMandate,
 } from "./core/agent";
-import { decideApproval, pendingApprovals } from "./core/approvals";
+import { createApproval, decideApproval, pendingApprovals } from "./core/approvals";
 import { getCase, transitionCase } from "./core/caseEngine";
 import { addEvidence, claimView, evidenceView, listClaims, listEvidence } from "./core/evidence";
 import { addMs, json, nowIso, q, q1, run } from "./core/db";
@@ -15,6 +15,7 @@ import { caseEvent, auditEvent } from "./core/events";
 import { cancelFollowUps, scheduleFollowUp } from "./core/followups";
 import { activateMandate, createMandate, getLatestMandate, revokeMandate } from "./core/mandate";
 import { latestOutcome } from "./core/outcomes";
+import { aggregateResults, patchResults, receiptState, recordReceipt, derivedResults, getResultsMeta, RECEIPT_TIER_LABELS } from "./core/results";
 import { addDeadline } from "./core/escalation";
 import { gatherCaseFacts, renderBundleLines } from "./core/templates";
 import { buildPdf } from "./core/pdf";
@@ -62,6 +63,13 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
   }
   if (path === "/api/health") return res({ ok: true, service: "company-service", time: nowIso() });
 
+  // Public results aggregate — counts/medians only, merchant buckets under the
+  // sample floor merge into "other" so no single case is inferable. Powers the
+  // /results page; no per-case data is ever exposed here.
+  if (path === "/api/results" && req.method === "GET") {
+    return res(await aggregateResults(env.DB));
+  }
+
   // Chat-companion routes have their own auth (bearer pairing tokens for the
   // extension; session+CSRF for management) and must run before the global
   // session gate. Returns null when the path isn't /api/companion*.
@@ -83,6 +91,29 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
     return res({ user, csrf: session.csrf });
   }
 
+  // Owner-only per-case results detail (M4). Gated by ADMIN_EMAILS binding
+  // (comma-separated); unset → 404, same as a missing route.
+  if (path === "/api/admin/results" && req.method === "GET") {
+    const admins = (env.ADMIN_EMAILS ?? "").split(",").map((e) => e.trim().toLowerCase()).filter(Boolean);
+    const me = await q1<{ email: string }>(env.DB, `SELECT email FROM users WHERE id = ?`, uid);
+    if (!admins.length || !me || !admins.includes(me.email.toLowerCase())) return err(404, "not found");
+    const rows = await q(
+      env.DB,
+      `SELECT id, title, company_name, status, amount_cents, meta, created_at FROM cases ORDER BY created_at DESC LIMIT 500`,
+    );
+    const cases = [];
+    for (const r of rows as { id: string; title: string; company_name: string | null; status: string; amount_cents: number | null; meta: string | null; created_at: string }[]) {
+      const { tier, amountRecoveredCents } = await receiptState(env.DB, r.id);
+      cases.push({
+        id: r.id, title: r.title, company: r.company_name, status: r.status,
+        amountCents: r.amount_cents, receiptTier: tier, amountRecoveredCents,
+        results: (json<Record<string, unknown>>(r.meta ?? "{}", {}).results ?? {}),
+        createdAt: r.created_at,
+      });
+    }
+    return res({ cases });
+  }
+
   // ---- cases ----
   if (path === "/api/cases" && req.method === "GET") {
     const cases = await q(
@@ -95,12 +126,25 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
     return res({ cases, pendingApprovals: pending.length });
   }
   if (path === "/api/cases" && req.method === "POST") {
-    const b = (await req.json()) as { text?: string; scenario?: string };
+    const b = (await req.json()) as {
+      text?: string; scenario?: string;
+      startingState?: { daysOverdue?: number; priorAttempts?: number; refundInProgress?: boolean };
+    };
     if (!b.text || b.text.trim().length < 5) return err(400, "describe the problem in a sentence or two");
     const { caseId, objective } = await createCaseFromText(env, uid, b.text.trim());
     if (b.scenario) {
       await run(env.DB, `UPDATE cases SET meta = json_set(COALESCE(meta, '{}'), '$.scenario', ?) WHERE id = ?`, b.scenario, caseId);
     }
+    // M4/R8 starting state — CUSTOMER_STATED at intake, feeds M8 attribution.
+    await patchResults(env.DB, caseId, {
+      amount_claimed: objective.amountCents ?? null,
+      ...(typeof b.startingState?.daysOverdue === "number"
+        ? { days_overdue_at_start: Math.max(0, Math.round(b.startingState.daysOverdue)) } : {}),
+      ...(typeof b.startingState?.priorAttempts === "number"
+        ? { prior_customer_attempts: Math.max(0, Math.round(b.startingState.priorAttempts)) } : {}),
+      ...(typeof b.startingState?.refundInProgress === "boolean"
+        ? { refund_already_in_progress: b.startingState.refundInProgress } : {}),
+    });
     await caseEvent(env.DB, caseId, "intake_completed", "agent", { objective });
     return res({ caseId, objective, suggestedMandate: suggestedMandate(objective) });
   }
@@ -141,6 +185,69 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
       });
       return res({ id });
     }
+    // M4: refund-confirmation document → RECEIVED (DOCUMENT_VERIFIED) tier.
+    // Accepts pasted text (forwarded email) or an existing evidence id (file
+    // already uploaded via /evidence). Amounts: parsed from the document when
+    // possible, else the customer-entered amount — the document itself is the
+    // verification, not the parsed figure.
+    if (sub === "/receipt-evidence" && req.method === "POST") {
+      const b = (await req.json()) as { text?: string; evidenceId?: string; amountCents?: number };
+      let evidenceId: string;
+      let docText: string | null = null;
+      if (b.evidenceId) {
+        const ev = await q1<{ id: string; text: string | null }>(
+          env.DB, `SELECT id, text FROM case_evidence WHERE id = ? AND case_id = ?`, b.evidenceId, caseId);
+        if (!ev) return err(404, "evidence not found on this case");
+        evidenceId = ev.id;
+        docText = ev.text;
+      } else if (b.text?.trim()) {
+        docText = b.text.trim();
+        evidenceId = await addEvidence(env.DB, env, caseId, {
+          kind: "receipt",
+          text: docText,
+          source: "customer",
+          label: "Refund confirmation (document)",
+        });
+      } else {
+        return err(400, "provide pasted text or an evidenceId");
+      }
+      let cents = typeof b.amountCents === "number" && b.amountCents > 0 ? Math.round(b.amountCents) : null;
+      if (cents === null && docText) {
+        const m = docText.match(/\$\s*([0-9][0-9,]*(?:\.[0-9]{2})?)/);
+        if (m) cents = Math.round(Number(m[1]!.replace(/,/g, "")) * 100);
+      }
+      if (cents === null) {
+        const c = await q1<{ amount_cents: number | null }>(env.DB, `SELECT amount_cents FROM cases WHERE id = ?`, caseId);
+        cents = c?.amount_cents ?? 0;
+      }
+      await recordReceipt(env.DB, caseId, {
+        source: "document_verified",
+        amountCents: cents,
+        detail: "Refund-confirmation document stored — receipt is document-verified.",
+        evidenceId,
+      });
+      await caseEvent(env.DB, caseId, "receipt_document_verified", "customer", { evidenceId, amountCents: cents });
+      // If no resolution confirmation is pending, ask whether this resolves
+      // the case — VERIFIED_RESOLVED only lands on customer confirm.
+      const pendingRes = await q1<{ id: string }>(
+        env.DB,
+        `SELECT id FROM approval_requests WHERE case_id = ? AND kind IN ('confirm_resolution','verify_receipt') AND status = 'pending'`,
+        caseId,
+      );
+      if (!pendingRes) {
+        await createApproval(env.DB, caseId, {
+          kind: "confirm_resolution",
+          summary: "Your receipt is document-verified. Does this fully resolve the case?",
+          detail: { evidenceId, amountCents: cents },
+          options: [
+            { id: "resolved", label: "Yes — fully resolved, close it", kind: "approve" },
+            { id: "incomplete", label: "No — incomplete, keep working it", kind: "reject" },
+          ],
+        });
+      }
+      return res({ ok: true, evidenceId, amountCents: cents, tier: "document_verified" });
+    }
+
     const evFileMatch = sub.match(/^\/evidence\/([^/]+)\/file$/);
     if (evFileMatch && req.method === "GET") {
       const ev = await q1<{ r2_key: string | null; mime: string | null }>(
@@ -356,7 +463,7 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
   }
   const aprMatch = path.match(/^\/api\/approvals\/([^/]+)\/decide$/);
   if (aprMatch && req.method === "POST") {
-    const b = (await req.json()) as { optionId?: string };
+    const b = (await req.json()) as { optionId?: string; amountCents?: number };
     // Ownership check via case join.
     const row = await q1<{ case_id: string }>(
       env.DB,
@@ -365,7 +472,9 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
     if (!row) return err(404, "approval not found");
     const r = await decideApproval(env.DB, aprMatch[1]!, b.optionId ?? "", uid);
     if (!r.ok) return err(400, r.error ?? "decision failed");
-    await handleApprovalDecision(env, aprMatch[1]!);
+    await handleApprovalDecision(env, aprMatch[1]!, {
+      amountCents: typeof b.amountCents === "number" ? Math.max(0, Math.round(b.amountCents)) : undefined,
+    });
     return res({ ok: true });
   }
 
@@ -494,8 +603,11 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
 async function caseDetail(env: Env, caseId: string) {
   const c = await getCase(env.DB, caseId);
   const meta = json<{ orderRef?: string; trackingRef?: string; scenario?: string }>((c as Record<string, unknown> | null)?.meta as string | null, {});
-  const [claims, evidence, events, messages, mandate, outcome, approvals, actions, followups, costs, escalations, deadlines] =
+  const [receipt, resultsMeta, derived, claims, evidence, events, messages, mandate, outcome, approvals, actions, followups, costs, escalations, deadlines] =
     await Promise.all([
+      receiptState(env.DB, caseId),
+      getResultsMeta(env.DB, caseId),
+      derivedResults(env.DB, caseId),
       listClaims(env.DB, caseId),
       listEvidence(env.DB, caseId),
       q(env.DB, `SELECT * FROM case_events WHERE case_id = ? ORDER BY created_at ASC, rowid ASC`, caseId),
@@ -516,6 +628,8 @@ async function caseDetail(env: Env, caseId: string) {
     case: c,
     orderRef: meta.orderRef ?? null,
     trackingRef: meta.trackingRef ?? null,
+    receipt: { tier: receipt.tier, tierLabel: RECEIPT_TIER_LABELS[receipt.tier], amountRecoveredCents: receipt.amountRecoveredCents },
+    results: { ...resultsMeta, ...derived },
     claims: claims.map((r: Record<string, unknown>) => claimView(r)),
     evidence: evidence.map((r: Record<string, unknown>) => evidenceView(r)),
     events: events.map((r: Record<string, unknown>) => ({

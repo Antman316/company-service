@@ -13,6 +13,7 @@ import { caseEvent, auditEvent } from "./events";
 import { dueFollowUps, markFired, scheduleFollowUp, cancelFollowUps } from "./followups";
 import { getActiveMandate } from "./mandate";
 import { latestOutcome, recordOutcome } from "./outcomes";
+import { finalizeResults, receiptState, recordReceipt } from "./results";
 import { describeAction, nextProposedAction, proposeAction } from "./actions";
 import { classifyAction, classifyMerchantOffer } from "./policy";
 import {
@@ -789,7 +790,8 @@ export async function ingestMerchantMessage(
         summary: `${caseRow.company_name ?? "The merchant"} says the refund/resolution was issued${parsed.amountCents ? ` ($${(parsed.amountCents / 100).toFixed(2)})` : ""}. Have you received it?`,
         detail: { merchantClaim: body.slice(0, 400) },
         options: [
-          { id: "received", label: "Yes — received, close the case", kind: "approve" },
+          { id: "received", label: "Yes — received in full", kind: "approve" },
+          { id: "partial", label: "Partially — some arrived, more expected", kind: "approve" },
           { id: "not_received", label: "Not yet — keep following up", kind: "reject" },
         ],
       });
@@ -919,7 +921,7 @@ export async function runFollowUpSweep(env: Env): Promise<{ fired: number; deadl
 // case according to what they chose.
 // ---------------------------------------------------------------------------
 
-export async function handleApprovalDecision(env: Env, approvalId: string): Promise<void> {
+export async function handleApprovalDecision(env: Env, approvalId: string, payload: { amountCents?: number } = {}): Promise<void> {
   const db = env.DB;
   const row = await q1<{
     id: string; case_id: string; action_id: string | null; kind: string;
@@ -931,14 +933,76 @@ export async function handleApprovalDecision(env: Env, approvalId: string): Prom
   if (!caseRow) return;
 
   if (row.kind === "confirm_receipt") {
-    if (row.resolved_option === "received") {
-      await recordOutcome(db, row.case_id, "VERIFIED_RESOLVED", "Customer confirmed receipt. Case closed.", { actor: "customer" });
-      await transitionIfAble(db, row.case_id, "RESOLVED", "customer confirmed resolution");
-      await cancelFollowUps(db, row.case_id);
+    if (row.resolved_option === "received" || row.resolved_option === "partial") {
+      // M4: self-report is RECEIVED (CUSTOMER_CONFIRMED) — never the top tier.
+      // VERIFIED_RESOLVED additionally requires document-verified money.
+      const claimed = caseRow.amount_cents ?? 0;
+      const cents = row.resolved_option === "partial"
+        ? Math.max(0, Math.min(payload.amountCents ?? 0, claimed || Number.MAX_SAFE_INTEGER))
+        : claimed;
+      await recordReceipt(db, row.case_id, {
+        source: "customer_confirmed",
+        amountCents: cents,
+        detail: row.resolved_option === "partial"
+          ? `Customer confirmed a partial receipt${cents ? ` of $${(cents / 100).toFixed(2)}` : ""}.`
+          : "Customer confirmed receipt — self-reported, not document-verified.",
+      });
+      await createApproval(db, row.case_id, {
+        kind: "verify_receipt",
+        summary: row.resolved_option === "partial"
+          ? "Partial receipt recorded. Add the refund-confirmation email or screenshot on the case page to document-verify it — and keep pursuing the rest, or close here?"
+          : "Receipt recorded as customer-confirmed. To reach document-verified status, add the refund-confirmation email or bank-statement screenshot on the case page. Close the case now or keep pursuing?",
+        detail: { receiptTier: "customer_confirmed" },
+        options: [
+          { id: "close", label: "Close the case", kind: "approve" },
+          { id: "keep_following", label: "Keep following up", kind: "reject" },
+        ],
+      });
+      await transitionIfAble(db, row.case_id, "RESOLUTION_PROPOSED", "receipt confirmed — awaiting close or document verification");
     } else {
       await recordOutcome(db, row.case_id, "REQUESTED", "Customer: not received yet — continuing to follow up.", { actor: "customer" });
       await scheduleFollowUp(db, row.case_id, "check_commitment", addMs(nowIso(), 24 * 3600 * 1000));
       await transitionIfAble(db, row.case_id, "WAITING_FOR_COMPANY", "customer has not received resolution");
+    }
+    return;
+  }
+
+  if (row.kind === "verify_receipt") {
+    const { tier } = await receiptState(db, row.case_id);
+    if (row.resolved_option === "close") {
+      if (tier === "document_verified") {
+        await recordOutcome(db, row.case_id, "VERIFIED_RESOLVED", "Document-verified receipt + customer confirmed resolution. Case closed.", { actor: "customer" });
+      }
+      await finalizeResults(db, row.case_id);
+      await transitionIfAble(db, row.case_id, "RESOLVED",
+        tier === "document_verified"
+          ? "verified resolved — document + customer confirm"
+          : "resolved on customer confirmation alone — no document on file");
+      await cancelFollowUps(db, row.case_id);
+    } else {
+      await recordOutcome(db, row.case_id, "REQUESTED", "Customer: continuing to pursue the remainder.", { actor: "customer" });
+      await scheduleFollowUp(db, row.case_id, "check_commitment", addMs(nowIso(), 24 * 3600 * 1000));
+      await transitionIfAble(db, row.case_id, "WAITING_FOR_COMPANY", "customer pursuing remainder after partial receipt");
+    }
+    return;
+  }
+
+  if (row.kind === "confirm_resolution") {
+    const { tier } = await receiptState(db, row.case_id);
+    if (row.resolved_option === "resolved") {
+      if (tier === "document_verified") {
+        await recordOutcome(db, row.case_id, "VERIFIED_RESOLVED", "Document-verified receipt + customer confirmed resolution. Case closed.", { actor: "customer" });
+      }
+      await finalizeResults(db, row.case_id);
+      await transitionIfAble(db, row.case_id, "RESOLVED",
+        tier === "document_verified"
+          ? "verified resolved — document + customer confirm"
+          : "resolved without document verification — stays at customer-confirmed tier");
+      await cancelFollowUps(db, row.case_id);
+    } else {
+      await recordOutcome(db, row.case_id, "REQUESTED", "Customer: document-verified receipt does not fully resolve the case — continuing.", { actor: "customer" });
+      await scheduleFollowUp(db, row.case_id, "check_commitment", addMs(nowIso(), 24 * 3600 * 1000));
+      await transitionIfAble(db, row.case_id, "WAITING_FOR_COMPANY", "customer says receipt is incomplete");
     }
     return;
   }

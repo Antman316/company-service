@@ -28,9 +28,9 @@ export const api = {
   signout: () => req("/api/auth/signout", { method: "POST" }),
 
   listCases: () => req<{ cases: any[]; pendingApprovals: number }>("/api/cases"),
-  createCase: (text: string, scenario?: string) =>
+  createCase: (text: string, scenario?: string, startingState?: { daysOverdue?: number; priorAttempts?: number; refundInProgress?: boolean }) =>
     req<{ caseId: string; objective: any; suggestedMandate: any }>(
-      "/api/cases", { method: "POST", body: JSON.stringify({ text, scenario }) }),
+      "/api/cases", { method: "POST", body: JSON.stringify({ text, scenario, startingState }) }),
   caseDetail: (id: string) => req<any>(`/api/cases/${id}`),
   addEvidence: (id: string, b: { kind?: string; text?: string; label?: string }) =>
     req(`/api/cases/${id}/evidence`, { method: "POST", body: JSON.stringify(b) }),
@@ -58,8 +58,11 @@ export const api = {
   addNote: (id: string, text: string) => req(`/api/cases/${id}/message`, { method: "POST", body: JSON.stringify({ text }) }),
 
   approvals: () => req<{ approvals: any[] }>("/api/approvals"),
-  decide: (id: string, optionId: string) =>
-    req(`/api/approvals/${id}/decide`, { method: "POST", body: JSON.stringify({ optionId }) }),
+  decide: (id: string, optionId: string, amountCents?: number) =>
+    req(`/api/approvals/${id}/decide`, { method: "POST", body: JSON.stringify({ optionId, amountCents }) }),
+  receiptEvidence: (id: string, b: { text?: string; evidenceId?: string; amountCents?: number }) =>
+    req(`/api/cases/${id}/receipt-evidence`, { method: "POST", body: JSON.stringify(b) }),
+  results: () => req<any>("/api/results"),
 
   connections: () => req<{ connections: any[] }>("/api/connections"),
   addConnection: (b: { type: string; provider: string; label: string; config?: Record<string, string> }) =>

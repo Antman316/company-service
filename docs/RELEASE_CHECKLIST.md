@@ -36,6 +36,13 @@ staged in D1 first.
 6. Prod metadata must include `keep_bindings: ["secret_text"]` (binding
    **types**, not names) so worker secrets survive; never pass a bare
    `secret_text` binding with no `text` (error 10021).
+7. **The manual upload wipes the cron schedule.** The scripts PUT replaces
+   the whole deployment spec, so after every manual deploy re-register:
+   `PUT /accounts/{acc}/workers/scripts/{worker}/schedules` with body
+   `[{"cron":"*/5 * * * *"}]` (bare array — `{"crons":[…]}` is rejected
+   with 10026). Verify with `GET …/schedules`. Workers Observability is
+   also off on manual deploys, so D1 state (follow_ups.status) is the
+   ground truth for whether the sweep fired.
 
 ## Rollback
 

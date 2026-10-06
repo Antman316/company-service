@@ -88,6 +88,21 @@ elsewhere as built.
   video) requires real customer accounts and is not yet met.
 - Companion endpoints are rate-limited per pairing (120/min, 4000/day, counted
   from the audit trail) and every call writes an audit event.
+- **Results & receipt tiers (M4) IMPLEMENTED.** `RECEIVED` splits by evidence
+  source: `customer_confirmed` vs `document_verified` (outcome `evidence_note`
+  carries it). `VERIFIED_RESOLVED` requires BOTH a document on file and the
+  customer confirming resolution — self-report alone tops out at RECEIVED.
+  A customer can still close a case on their word alone; it stays at the
+  RECEIVED tier and is labeled as such everywhere. Partial receipts record
+  partial amounts; a document that verifies already-confirmed money never
+  double-counts (`amount_recovered` = max attested, additions are increments).
+- `GET /api/results` is public but aggregate-only — merchants with fewer than
+  3 cases merge into "other" so no single case is inferable; totals include
+  SIMULATED cases (the caveat on the page says so). Owner-only per-case detail:
+  `GET /api/admin/results` gated by the `ADMIN_EMAILS` binding.
+- Document verification means "a document was stored on the case" — the amount
+  is parsed from the document text when possible, else customer-entered; the
+  parsed figure is not itself verified against a bank feed (no Plaid in V1).
 - No 2FA, no email verification, no password reset.
 - ~~Export/delete-account endpoints not shipped~~ — **done**:
   `/api/account/export` (13-table dump) + `/api/account/delete`
