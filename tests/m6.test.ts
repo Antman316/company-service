@@ -43,6 +43,13 @@ describe("M6 merchant directory", () => {
     const pbIds = new Set(playbooks.map((p) => p.company_id));
     for (const m of LAUNCH_MERCHANTS) expect(pbIds.has(m.id), `playbook for ${m.name}`).toBe(true);
 
+    // Pre-M6 guessed rows are cleaned up by the seed (idempotent DELETE).
+    const legacy = await q<{ id: string }>(
+      env.DB,
+      `SELECT id FROM company_coverage WHERE id IN ('cov_cmp_chewy_email','cov_cmp_amazon_assist','cov_cmp_walmart_assist','cov_cmp_target_assist')`,
+    );
+    expect(legacy.length).toBe(0);
+
     // Idempotent: a second seed adds nothing.
     await seedRegistry(env.DB);
     const companies2 = await q<{ id: string }>(env.DB, `SELECT id FROM companies`);
@@ -52,8 +59,9 @@ describe("M6 merchant directory", () => {
   });
 
   it("labels lanes CONTACT_CONFIRMED, never VERIFIED, until a real case uses them", async () => {
-    // Chewy email stays VERIFIED — it earned that on prod with a real reply.
-    expect((await covRow("cov_cmp_chewy_email"))?.verification_status).toBe("VERIFIED");
+    // Chewy email stays VERIFIED under its pre-M6 id — it earned that on
+    // prod with a real reply; the row keeps its original timestamp.
+    expect((await covRow("cov_chewy_email"))?.verification_status).toBe("VERIFIED");
     expect((await covRow("cov_cmp_zappos_email"))?.verification_status).toBe("CONTACT_CONFIRMED");
     expect((await covRow("cov_cmp_amazon_chat"))?.verification_status).toBe("CONTACT_CONFIRMED");
     expect((await covRow("cov_cmp_etsy_form"))?.verification_status).toBe("CONTACT_CONFIRMED");
