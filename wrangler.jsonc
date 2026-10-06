@@ -28,6 +28,21 @@
       "name": "MAILOUT"
     }
   ],
+  // M9: inbound bursts buffer here; the raw MIME goes to R2 first (queue
+  // messages cap at 128KB, attachments exceed it). Consumer registered on
+  // the queue points at this worker.
+  "queues": {
+    "producers": [{ "binding": "INBOUND_Q", "queue": "cs-inbound" }],
+    "consumers": [
+      { "queue": "cs-inbound", "max_batch_size": 10, "max_batch_timeout": 5, "max_retries": 3 }
+    ]
+  },
+  // M9: one durable instance per follow-up; sleeps until due_at, then fires.
+  // The */5 cron sweep stays as backstop — markFired's atomic claim means
+  // whichever path fires first wins, the other no-ops.
+  "workflows": [
+    { "name": "case-workflow", "binding": "CASE_WORKFLOW", "class_name": "CaseWorkflow" }
+  ],
   "triggers": {
     "crons": ["*/5 * * * *"]
   },

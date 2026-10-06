@@ -32,6 +32,9 @@ import {
 } from "./http/account";
 import { sendVerificationEmail, sendSystemEmail } from "./core/notify";
 import { healthCheckDue, runDirectoryHealthCheck } from "./adapters/directory";
+import { backupDue, inboundRawKey, reportError, runDailyBackup } from "./core/ops";
+import type { InboundQueueMessage } from "./core/ops";
+export { CaseWorkflow } from "./core/caseWorkflow";
 import { activeCaseCount, MAX_ACTIVE_CASES_PER_USER, recordFraudSignal } from "./core/abuse";
 import { STATIC_FILES } from "./static";
 
@@ -412,7 +415,7 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
       await caseEvent(env.DB, caseId, "assisted_sent", "customer", { actionId: act.id });
       await transitionCase(env.DB, caseId, "WAITING_FOR_COMPANY", { reason: "customer sent assisted message", actor: "customer" });
       // Wake the case if the merchant never replies.
-      await scheduleFollowUp(env.DB, caseId, "send_followup", addMs(nowIso(), 2 * 24 * 3600 * 1000), { via: "assisted" });
+      await scheduleFollowUp(env.DB, caseId, "send_followup", addMs(nowIso(), 2 * 24 * 3600 * 1000), { via: "assisted" }, env);
       return res({ ok: true });
     }
     if (sub === "/assisted/reply" && req.method === "POST") {
@@ -857,29 +860,45 @@ async function ingestInboundText(
 // Full inbound pipeline for a parsed email (Email Routing handler + tests).
 // Returns 'processed' | 'duplicate' | 'rejected'. Rejected mail is bounced back
 // to the sender by setReject in the caller.
-export async function ingestInboundEmail(
-  env: Env,
-  parsed: {
-    to: string;
-    from?: string;
-    subject?: string;
-    body: string;
-    messageId?: string | null;
-    inReplyTo?: string | null;
-    references?: string | string[] | null;
-    attachments?: { filename: string; mimeType: string; content: ArrayBuffer | Uint8Array }[];
-  },
-): Promise<{ result: string; caseId?: string }> {
-  const inboundDomain = env.INBOUND_ADDRESS?.split("@")[1] ?? env.EMAIL_DOMAIN ?? "agentmasterkey.com";
+export interface InboundParsed {
+  to: string;
+  from?: string;
+  subject?: string;
+  body: string;
+  messageId?: string | null;
+  inReplyTo?: string | null;
+  references?: string | string[] | null;
+  attachments?: { filename: string; mimeType: string; content: ArrayBuffer | Uint8Array }[];
+}
 
-  // Domain guard: only mail addressed to our inbound domain is case mail.
+// The verified-sender check for case+new@ forward-to-start. Extracted so the
+// queue producer can decide "queueable vs bounce" without creating a case.
+async function forwardNewSender(env: Env, parsed: InboundParsed): Promise<{ id: string; email: string } | null> {
+  if (!/case\+new@/i.test(parsed.to)) return null;
+  const senderEmail = (parsed.from ?? "").match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/)?.[0]?.toLowerCase();
+  if (!senderEmail) return null;
+  const sender = await q1<{ id: string; email_verified_at: string | null }>(
+    env.DB,
+    `SELECT id, email_verified_at FROM users WHERE lower(email) = ?`,
+    senderEmail,
+  );
+  return sender?.email_verified_at ? { id: sender.id, email: senderEmail } : null;
+}
+
+// Cheap synchronous preflight shared by the email() producer and the queue
+// consumer's full ingest: domain guard, message-id dedup, case resolution,
+// forward-to-start eligibility. No writes beyond audit rows.
+async function preflightInbound(
+  env: Env,
+  parsed: InboundParsed,
+): Promise<{ result: "rejected" | "duplicate" | "ok"; caseId?: string; forwardSender?: { id: string; email: string } }> {
+  const inboundDomain = env.INBOUND_ADDRESS?.split("@")[1] ?? env.EMAIL_DOMAIN ?? "agentmasterkey.com";
   if (!parsed.to.toLowerCase().endsWith(`@${inboundDomain}`)) {
     await auditEvent(env.DB, { type: "inbound_wrong_domain", severity: "warning", data: { to: parsed.to } });
     return { result: "rejected" };
   }
-
-  // Idempotent: the same RFC message-id is never ingested twice, even if Email
-  // Routing retries delivery.
+  // Idempotent: the same RFC message-id is never ingested twice, even if the
+  // transport retries delivery (Email Routing or a queue redelivery).
   if (parsed.messageId) {
     const dup = await q1<{ id: string }>(
       env.DB,
@@ -891,35 +910,44 @@ export async function ingestInboundEmail(
       return { result: "duplicate" };
     }
   }
-
   const threadIds = extractMessageIds([
     parsed.inReplyTo ?? undefined,
     parsed.references ?? undefined,
     parsed.messageId ?? undefined,
   ]);
-  let caseId = await resolveInboundCase(env.DB, {
+  const caseId = await resolveInboundCase(env.DB, {
     to: parsed.to,
     subject: parsed.subject ?? "",
     messageIds: threadIds,
   });
+  if (caseId) return { result: "ok", caseId };
+  const forwardSender = await forwardNewSender(env, parsed);
+  if (forwardSender) return { result: "ok", forwardSender };
+  await auditEvent(env.DB, { type: "inbound_unmatched", severity: "warning", data: { to: parsed.to, subject: parsed.subject } });
+  return { result: "rejected" };
+}
+
+export async function ingestInboundEmail(
+  env: Env,
+  parsed: InboundParsed,
+): Promise<{ result: string; caseId?: string }> {
+  const pre = await preflightInbound(env, parsed);
+  if (pre.result !== "ok") return { result: pre.result };
+
+  let caseId = pre.caseId;
   // Forward-to-start: mail to case+new@<domain> from a *verified* account
-  // email becomes a new case. Unverified senders get rejected — the sender
-  // identity must be proven before we trust forwarded content (M7).
-  if (!caseId && /case\+new@/i.test(parsed.to)) {
-    const senderEmail = (parsed.from ?? "").match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/)?.[0]?.toLowerCase();
-    const sender = senderEmail
-      ? await q1<{ id: string; email_verified_at: string | null }>(
-          env.DB,
-          `SELECT id, email_verified_at FROM users WHERE lower(email) = ?`,
-          senderEmail,
-        )
-      : null;
-    if (sender?.email_verified_at && senderEmail) {
-      const { caseId: newId2 } = await createCaseFromText(
+  // email becomes a new case. Unverified senders were already rejected by
+  // preflight — the sender identity must be proven before we trust
+  // forwarded content (M7).
+  if (!caseId && pre.forwardSender) {
+    const sender = pre.forwardSender;
+    {
+      const senderEmail = sender.email;
+      const create = await createCaseFromText(
         env, sender.id,
         `${parsed.subject ? `Fwd: ${parsed.subject}\n\n` : ""}${parsed.body}`.slice(0, 8000),
       );
-      caseId = newId2;
+      caseId = create.caseId;
       await auditEvent(env.DB, { type: "forward_to_start", severity: "info", userId: sender.id, caseId, data: { from: senderEmail } });
       await sendSystemEmail(env, senderEmail,
         `Your forwarded email started a case`,
@@ -1088,57 +1116,117 @@ export default {
       return new Response("Company Service", { status: 200 });
     } catch (e) {
       console.error("unhandled", e);
+      await reportError(env, e, { route: new URL(req.url).pathname, kind: "fetch" }).catch(() => {});
       return err(500, "internal error");
     }
   },
 
   // Durable follow-up sweep — the "customer never has to remember" engine.
+  // Also the M9 maintenance driver: monthly lane health + daily D1 backup.
   async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
     ctx.waitUntil(
       (async () => {
-        const r = await runFollowUpSweep(env);
-        console.log(`[sweep] fired=${r.fired}`);
-        // M6 monthly lane-health check — gated to once per 30 days inside the
-        // 5-min sweep.
-        if (await healthCheckDue(env.DB)) {
-          const h = await runDirectoryHealthCheck(env);
-          console.log(`[healthcheck] checked=${h.checked} degraded=${h.degraded}`);
+        try {
+          const r = await runFollowUpSweep(env);
+          console.log(`[sweep] fired=${r.fired}`);
+          // M6 monthly lane-health check — gated to once per 30 days inside
+          // the 5-min sweep.
+          if (await healthCheckDue(env.DB)) {
+            const h = await runDirectoryHealthCheck(env);
+            console.log(`[healthcheck] checked=${h.checked} degraded=${h.degraded}`);
+          }
+          // M9 daily D1 export → R2 (JSONL per table + manifest, 30d prune).
+          if (await backupDue(env.DB)) {
+            const b = await runDailyBackup(env);
+            console.log(`[backup] date=${b.date} tables=${b.tables} rows=${b.rows} pruned=${b.pruned}`);
+          }
+        } catch (e) {
+          await reportError(env, e, { route: "scheduled", kind: "sweep" }).catch(() => {});
+          throw e; // keep the failure visible to the cron instrumentation
         }
       })(),
     );
   },
 
   // Inbound email via Cloudflare Email Routing (real public route — a literal
-  // rule on the zone points env.INBOUND_ADDRESS at this handler). Proper MIME
-  // decode via postal-mime; ingestInboundEmail handles domain guard, message-id
-  // dedup, case resolution, metadata retention, attachments, and the untrusted
-  // content pipeline.
+  // rule on the zone points env.INBOUND_ADDRESS at this handler). Burst path
+  // (M9): when the INBOUND_Q queue is bound, the raw MIME lands in R2 and the
+  // heavy ingest runs in the queue consumer with retries; the cheap checks
+  // (domain guard, dedup, case resolution, forward-to-start eligibility) stay
+  // synchronous so unknown mail still gets a real bounce via setReject.
   async email(message: ForwardableEmailMessage, env: Env, _ctx: ExecutionContext): Promise<void> {
     try {
-      const parsed = await PostalMime.parse(message.raw);
-      const to = parsed.to?.[0]?.address ?? message.to ?? "";
-      // Prefer text/plain; fall back to a tag-stripped html render.
-      const body = parsed.text ?? (parsed.html ?? "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
-      const r = await ingestInboundEmail(env, {
-        to,
-        from: parsed.from?.address ?? "",
-        subject: parsed.subject ?? "",
-        body,
-        messageId: parsed.messageId ?? null,
-        inReplyTo: parsed.inReplyTo ?? null,
-        references: parsed.references ?? null,
-        attachments: (parsed.attachments ?? [])
-          .filter((a) => a.disposition === "attachment" && a.filename)
-          .map((a) => ({
-            filename: a.filename ?? "attachment",
-            mimeType: a.mimeType,
-            content: typeof a.content === "string" ? new TextEncoder().encode(a.content) : a.content,
-          })),
-      });
+      const rawBytes = await new Response(message.raw).arrayBuffer();
+      const parsed = await parseInboundRaw(rawBytes, message.to ?? "");
+      const pre = await preflightInbound(env, parsed);
+      if (pre.result === "rejected") { message.setReject("no matching case"); return; }
+      if (pre.result === "duplicate") return;
+
+      const inboundQ = env.INBOUND_Q;
+      if (inboundQ) {
+        const r2Key = inboundRawKey();
+        await env.EVIDENCE.put(r2Key, rawBytes);
+        await inboundQ.send({ r2Key, caseId: pre.caseId ?? null, enqueuedAt: nowIso() });
+        await auditEvent(env.DB, { type: "inbound_queued", severity: "info", caseId: pre.caseId ?? null, data: { r2Key, to: parsed.to } });
+        return;
+      }
+
+      const r = await ingestInboundEmail(env, parsed);
       if (r.result === "rejected") message.setReject("no matching case");
     } catch (e) {
       await auditEvent(env.DB, { type: "inbound_error", severity: "error", data: { error: String(e) } });
+      await reportError(env, e, { route: "email", kind: "inbound" }).catch(() => {});
       message.setReject("processing error");
     }
   },
+
+  // Queue consumer: burst-absorbing inbound ingest. At-least-once safe —
+  // the consumer re-runs the full ingestInboundEmail pipeline, whose
+  // message-id dedup makes a redelivery after success a no-op. The raw MIME
+  // blob in R2 is deleted after a terminal outcome (success or reject).
+  async queue(batch: MessageBatch<InboundQueueMessage>, env: Env): Promise<void> {
+    for (const msg of batch.messages) {
+      const { r2Key, caseId } = msg.body;
+      try {
+        const obj = await env.EVIDENCE.get(r2Key);
+        if (!obj) {
+          await auditEvent(env.DB, { type: "inbound_queue_missing", severity: "error", data: { r2Key, caseId } });
+          msg.ack();
+          continue;
+        }
+        const raw = await obj.arrayBuffer();
+        const parsed = await parseInboundRaw(raw, "");
+        const r = await ingestInboundEmail(env, parsed);
+        if (r.result === "rejected") {
+          await auditEvent(env.DB, { type: "inbound_queue_rejected", severity: "warning", caseId, data: { r2Key } });
+        }
+        await env.EVIDENCE.delete(r2Key).catch(() => {});
+        msg.ack();
+      } catch (e) {
+        await reportError(env, e, { route: "queue/inbound", kind: "inbound_queue", caseId: caseId ?? undefined }).catch(() => {});
+        msg.retry();
+      }
+    }
+  },
 };
+
+// postal-mime parse → the ingestInboundEmail input shape.
+async function parseInboundRaw(raw: ArrayBuffer, fallbackTo: string): Promise<InboundParsed> {
+  const parsed = await PostalMime.parse(raw);
+  return {
+    to: parsed.to?.[0]?.address ?? fallbackTo,
+    from: parsed.from?.address ?? "",
+    subject: parsed.subject ?? "",
+    body: parsed.text ?? (parsed.html ?? "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim(),
+    messageId: parsed.messageId ?? null,
+    inReplyTo: parsed.inReplyTo ?? null,
+    references: parsed.references ?? null,
+    attachments: (parsed.attachments ?? [])
+      .filter((a) => a.disposition === "attachment" && a.filename)
+      .map((a) => ({
+        filename: a.filename ?? "attachment",
+        mimeType: a.mimeType,
+        content: typeof a.content === "string" ? new TextEncoder().encode(a.content) : a.content,
+      })),
+  };
+}
