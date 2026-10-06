@@ -29,9 +29,25 @@ export function Dashboard({ nav, me }: { nav: (to: string) => void; me: { email:
         <div className="empty"><span className="spinner" /></div>
       ) : cases.length === 0 ? (
         <div className="empty" style={{ marginTop: 30 }}>
-          <div className="big">What do you need handled?</div>
-          <p>Describe a problem with a company — a missing refund, a wrong item, a damaged delivery — and your agent takes it from there.</p>
-          <button className="btn btn-primary" onClick={() => nav("/new")}>Start your first case</button>
+          <div className="big">Start your first case</div>
+          <p>Two ways in:</p>
+          <div className="grid grid-2" style={{ textAlign: "left", marginTop: 14 }}>
+            <div className="card" style={{ padding: 18 }}>
+              <strong>Forward a merchant email</strong>
+              <p className="small muted" style={{ margin: "6px 0 10px" }}>
+                Got a shipping notice, refund denial, or stonewall in your inbox? Forward it to{" "}
+                <strong>case+new@agentmasterkey.com</strong> — it becomes a case automatically.
+              </p>
+              <span className="small muted">(Works after your email is verified.)</span>
+            </div>
+            <div className="card" style={{ padding: 18 }}>
+              <strong>Describe the problem</strong>
+              <p className="small muted" style={{ margin: "6px 0 10px" }}>
+                A missing refund, wrong item, damaged delivery — say it in a sentence and the agent takes it from there.
+              </p>
+              <button className="btn btn-primary" onClick={() => nav("/new")}>Type it out</button>
+            </div>
+          </div>
         </div>
       ) : (
         <>

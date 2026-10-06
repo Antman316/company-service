@@ -1,5 +1,6 @@
 import { q1 } from "../core/db";
 import { costEvent } from "../core/events";
+import { spendGate } from "../core/spend";
 import { decryptJson } from "../security/crypto";
 import type {
   ModelProvider,
@@ -68,6 +69,8 @@ export async function runModel(
   request: ModelRequest,
 ): Promise<ModelResponse> {
   const { provider, isLocal } = await resolveProvider(env, ctx);
+  // §11 abuse/cost gate — every non-local call must pass it before executing.
+  await spendGate(env, { userId: ctx.userId, caseId: ctx.caseId }, isLocal);
   const resp = await provider.execute(request);
   await costEvent(env.DB, {
     caseId: ctx.caseId,

@@ -12,6 +12,9 @@ staging VERIFIED 2026-10-06 (signup + seed + sim inbound on the live route).
 | D1 | `company-service-db` `e78401a5-765a-4db1-8cc9-b16d51d1d091` | `company-service-db-staging` `67461e33-8f67-4534-b849-5052aba4db98` |
 | R2 | `company-service-evidence` | `company-service-evidence-staging` |
 | `ENVIRONMENT` | `production` | `staging` (sim endpoints enabled) |
+| `APP_ORIGIN` | `https://company-service.agentmasterkey.com` | `https://cs-staging.agentmasterkey.com` |
+| `TURNSTILE_SITE_KEY` | `0x4AAAAAAFO5XgDSNuyG09sW` (public widget key) | same |
+| `TURNSTILE_SECRET` | worker `secret_text` (provisioned 2026-10-06) | same widget secret on staging |
 | Route | zone Workers route `company-service.agentmasterkey.com/*` + proxied AAAA `100::` | route `f80ee9504c2b47e5b6ad4493d872ac6d` + AAAA `ccc21d7b0018c5929c690c48291e94e0` |
 | Secrets | `SECRET_KEY` etc. — preserve with `keep_bindings` | `SECRET_KEY` = org secret `CS_STAGING_SECRET_KEY` |
 
@@ -36,6 +39,11 @@ staged in D1 first.
 6. Prod metadata must include `keep_bindings: ["secret_text"]` (binding
    **types**, not names) so worker secrets survive; never pass a bare
    `secret_text` binding with no `text` (error 10021).
+   `plain_text` bindings (vars) are rewritten by the upload — always carry
+   the full set from `wrangler.jsonc` **plus** `APP_ORIGIN` and
+   `TURNSTILE_SITE_KEY` (M7), or signup/email links lose their config.
+   `TURNSTILE_SECRET` itself stays a `secret_text` binding (already set on
+   both workers — provisioned 2026-10-06).
 7. **The manual upload wipes the cron schedule.** The scripts PUT replaces
    the whole deployment spec, so after every manual deploy re-register:
    `PUT /accounts/{acc}/workers/scripts/{worker}/schedules` with body

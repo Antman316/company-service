@@ -268,3 +268,23 @@ input, textarea, select { font: inherit; color: inherit; }
 .tbl td { padding: 9px 10px; border-bottom: 1px solid var(--line); }
 .tbl tr:last-child td { border-bottom: none; }
 .tbl td:not(:first-child), .tbl th:not(:first-child) { text-align: right; }
+
+/* M7 — auth extras, legal pages, verification result */
+.check-row { display: flex; gap: 10px; align-items: flex-start; margin: 14px 0; font-size: 13.5px; color: var(--ink-2); }
+.check-row input[type="checkbox"] { margin-top: 3px; accent-color: var(--accent); }
+.check-row a { color: var(--accent); }
+.notice-box { background: var(--green-soft); color: var(--green); border-radius: 8px; padding: 10px 14px; font-size: 14px; margin-bottom: 14px; }
+.verify-banner { background: var(--amber-soft); color: var(--amber-ink); border: 1px solid var(--amber); border-radius: 10px; padding: 12px 16px; margin-bottom: 18px; display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; font-size: 14px; }
+.legal-page { max-width: 720px; margin: 0 auto; padding: 40px 20px 80px; line-height: 1.65; }
+.legal-page h1 { font-size: 28px; margin-bottom: 4px; }
+.legal-page h2 { font-size: 19px; margin-top: 28px; margin-bottom: 8px; }
+.legal-page p, .legal-page li { font-size: 15px; color: var(--ink-2); }
+.legal-page .muted-line { color: var(--ink-3); font-size: 13px; margin-bottom: 28px; }
+.legal-page ul { padding-left: 22px; }
+.site-footer { border-top: 1px solid var(--line); padding: 24px 20px; display: flex; justify-content: center; gap: 26px; font-size: 13.5px; flex-wrap: wrap; }
+.site-footer a { color: var(--ink-3); text-decoration: none; }
+.site-footer a:hover { color: var(--ink-2); }
+.pref-row { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid var(--line); font-size: 14.5px; }
+.pref-row:last-child { border-bottom: 0; }
+.totp-box { display: flex; flex-direction: column; gap: 8px; }
+.totp-secret { font-family: var(--mono); font-size: 15px; letter-spacing: 2px; background: var(--bg-2); padding: 8px 12px; border-radius: 6px; display: inline-block; }
