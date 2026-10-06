@@ -23,8 +23,15 @@ import { seedRegistry } from "./adapters/registry";
 import { extractMessageIds, resolveInboundCase } from "./email/threading";
 import PostalMime from "postal-mime";
 import { encryptJson } from "./security/crypto";
-import { getSession, requireCsrf, signin, signout, signup } from "./http/auth";
+import { createSession, getSession, requireCsrf, signin, signout, signup } from "./http/auth";
 import { handleCompanion } from "./http/companion";
+import {
+  confirmPasswordReset, getNotificationPrefs, requestPasswordReset,
+  resendVerification, setNotificationPref, totpChallengeFor, totpChallengeRedeem,
+  totpConfirm, totpDisable, totpEnroll, verifyEmailLink,
+} from "./http/account";
+import { sendVerificationEmail, sendSystemEmail } from "./core/notify";
+import { activeCaseCount, MAX_ACTIVE_CASES_PER_USER, recordFraudSignal } from "./core/abuse";
 import { STATIC_FILES } from "./static";
 
 // --------------------------------------------------------------------------
@@ -39,6 +46,28 @@ function res(body: unknown, init: ResponseInit = {}): Response {
 }
 const err = (status: number, error: string) => res({ error }, { status });
 
+// Turnstile: enforced only when the secret is configured — dev/tests without
+// it pass through (the widget can't render without a site key anyway).
+async function verifyTurnstile(env: Env, token: string | undefined, req: Request): Promise<boolean> {
+  if (!env.TURNSTILE_SECRET) return true;
+  if (!token) return false;
+  try {
+    const r = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        secret: env.TURNSTILE_SECRET,
+        response: token,
+        remoteip: req.headers.get("cf-connecting-ip") ?? undefined,
+      }),
+    });
+    const d = (await r.json()) as { success?: boolean };
+    return d.success === true;
+  } catch {
+    return false;
+  }
+}
+
 type Ctx = { env: Env; url: URL; session: { userId: string; csrf: string; token: string } | null };
 
 async function api(req: Request, ctx: Ctx): Promise<Response> {
@@ -47,19 +76,77 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
   const secure = url.protocol === "https:";
 
   // ---- auth (unauthenticated) ----
+  // Signup prerequisites surfaced without a session: Turnstile site key when
+  // the secret is configured server-side (else the widget never renders).
+  if (path === "/api/auth/config" && req.method === "GET") {
+    return res({ turnstileSiteKey: env.TURNSTILE_SECRET ? (env.TURNSTILE_SITE_KEY ?? null) : null });
+  }
   if (path === "/api/auth/signup" && req.method === "POST") {
-    const b = (await req.json()) as { email?: string; password?: string };
+    const b = (await req.json()) as { email?: string; password?: string; consent?: boolean; turnstile?: string };
+    if (b.consent !== true) return err(400, "consent to the Terms and Privacy Policy is required");
+    if (!(await verifyTurnstile(env, b.turnstile, req))) return err(400, "human check failed — try again");
     const r = await signup(env.DB, b.email ?? "", b.password ?? "");
     if (!r.ok) return err(400, r.error);
-    const s = await signin(env.DB, b.email!, b.password!, secure);
+    await run(env.DB, `UPDATE users SET tos_accepted_at = ? WHERE id = ?`, nowIso(), r.userId);
+    await sendVerificationEmail(env, r.userId, b.email!.trim().toLowerCase());
+    const s = await signin(env.DB, b.email!, b.password!);
     if (!s.ok) return err(500, "auto sign-in failed");
-    return res({ ok: true, csrf: s.csrf }, { headers: { "Set-Cookie": s.cookie } });
+    const sess = await createSession(env.DB, s.userId, secure);
+    return res({ ok: true, csrf: sess.csrf, emailVerified: false }, { headers: { "Set-Cookie": sess.cookie } });
   }
   if (path === "/api/auth/signin" && req.method === "POST") {
     const b = (await req.json()) as { email?: string; password?: string };
-    const s = await signin(env.DB, b.email ?? "", b.password ?? "", secure);
+    const s = await signin(env.DB, b.email ?? "", b.password ?? "");
     if (!s.ok) return err(401, s.error);
-    return res({ ok: true, csrf: s.csrf }, { headers: { "Set-Cookie": s.cookie } });
+    // TOTP gate — password verified but the second factor decides the session.
+    const t = await totpChallengeFor(env, s.userId);
+    if (t.required) return res({ ok: true, totpRequired: true, ticket: t.ticket });
+    const sess = await createSession(env.DB, s.userId, secure);
+    return res({ ok: true, csrf: sess.csrf }, { headers: { "Set-Cookie": sess.cookie } });
+  }
+  if (path === "/api/auth/totp/challenge" && req.method === "POST") {
+    const b = (await req.json()) as { ticket?: string; code?: string };
+    const r = await totpChallengeRedeem(env, b.ticket ?? "", b.code ?? "");
+    if (!r.ok) return err(401, r.error ?? "challenge failed");
+    const sess = await createSession(env.DB, r.userId!, secure);
+    return res({ ok: true, csrf: sess.csrf }, { headers: { "Set-Cookie": sess.cookie } });
+  }
+  // One-shot email verification link — marks verified, then bounces into the
+  // SPA. No session needed (the token IS the proof).
+  if (path === "/api/auth/verify-email" && req.method === "GET") {
+    return verifyEmailLink(env, url.searchParams.get("token") ?? "");
+  }
+  if (path === "/api/auth/reset-request" && req.method === "POST") {
+    const b = (await req.json()) as { email?: string };
+    if (b.email) await requestPasswordReset(env, b.email);
+    return res({ ok: true });
+  }
+  if (path === "/api/auth/reset-confirm" && req.method === "POST") {
+    const b = (await req.json()) as { token?: string; password?: string };
+    const r = await confirmPasswordReset(env, b.token ?? "", b.password ?? "");
+    if (!r.ok) return err(400, r.error ?? "reset failed");
+    return res({ ok: true });
+  }
+  // Public abuse inbox — §11. Stored as a fraud signal; rate-limited by
+  // reporter address so the inbox itself can't be flooded.
+  if (path === "/api/abuse/report" && req.method === "POST") {
+    const b = (await req.json()) as { email?: string; caseId?: string; body?: string };
+    const body = (b.body ?? "").trim();
+    if (body.length < 10) return err(400, "tell us what happened in a sentence or two");
+    const reporter = (b.email ?? "anonymous").trim().toLowerCase().slice(0, 120);
+    const recent = await q1<{ n: number }>(
+      env.DB,
+      `SELECT COUNT(*) AS n FROM fraud_signals WHERE kind = 'abuse_report' AND detail LIKE ? AND created_at >= ?`,
+      `%${reporter}%`,
+      new Date(Date.now() - 24 * 3600 * 1000).toISOString(),
+    );
+    if ((recent?.n ?? 0) >= 5) return err(429, "too many reports — we have yours, thanks");
+    await recordFraudSignal(env.DB, {
+      userId: "public", caseId: b.caseId ?? null,
+      kind: "abuse_report",
+      detail: `reporter=${reporter} :: ${body.slice(0, 400)}`,
+    });
+    return res({ ok: true });
   }
   if (path === "/api/health") return res({ ok: true, service: "company-service", time: nowIso() });
 
@@ -86,9 +173,51 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
     return res({ ok: true }, { headers: { "Set-Cookie": cookie } });
   }
   if (path === "/api/auth/me") {
-    const user = await q1<{ id: string; email: string; created_at: string }>(
-      env.DB, `SELECT id, email, created_at FROM users WHERE id = ?`, uid);
-    return res({ user, csrf: session.csrf });
+    const user = await q1<{ id: string; email: string; created_at: string; email_verified_at: string | null; totp_secret_enc: string | null; tos_accepted_at: string | null }>(
+      env.DB, `SELECT id, email, created_at, email_verified_at, totp_secret_enc, tos_accepted_at FROM users WHERE id = ?`, uid);
+    return res({
+      user: user && {
+        ...user,
+        totp_secret_enc: undefined,
+        emailVerified: !!user.email_verified_at,
+        totpEnabled: !!user.totp_secret_enc?.startsWith("enc:"),
+        tosAcceptedAt: user.tos_accepted_at,
+      },
+      csrf: session.csrf,
+    });
+  }
+
+  // ---- M7 account security ----
+  if (path === "/api/auth/verify-email/resend" && req.method === "POST") {
+    const r = await resendVerification(env, uid);
+    if (!r.ok) return err(400, r.error ?? "could not resend");
+    return res({ ok: true });
+  }
+  if (path === "/api/auth/totp/enroll" && req.method === "POST") {
+    const r = await totpEnroll(env, uid);
+    if (!r.ok) return err(400, r.error ?? "enroll failed");
+    return res({ ok: true, secret: r.secret, otpauth: r.otpauth });
+  }
+  if (path === "/api/auth/totp/confirm" && req.method === "POST") {
+    const b = (await req.json()) as { code?: string };
+    const r = await totpConfirm(env, uid, b.code ?? "");
+    if (!r.ok) return err(400, r.error ?? "confirm failed");
+    return res({ ok: true });
+  }
+  if (path === "/api/auth/totp/disable" && req.method === "POST") {
+    const b = (await req.json()) as { code?: string };
+    const r = await totpDisable(env, uid, b.code ?? "");
+    if (!r.ok) return err(400, r.error ?? "disable failed");
+    return res({ ok: true });
+  }
+  if (path === "/api/notifications/prefs" && req.method === "GET") {
+    return res({ prefs: await getNotificationPrefs(env, uid) });
+  }
+  if (path === "/api/notifications/prefs" && req.method === "PUT") {
+    const b = (await req.json()) as { kind?: string; enabled?: boolean };
+    const r = await setNotificationPref(env, uid, b.kind ?? "", b.enabled === true);
+    if (!r.ok) return err(400, r.error ?? "pref failed");
+    return res({ ok: true });
   }
 
   // Owner-only per-case results detail (M4). Gated by ADMIN_EMAILS binding
@@ -131,6 +260,10 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
       startingState?: { daysOverdue?: number; priorAttempts?: number; refundInProgress?: boolean };
     };
     if (!b.text || b.text.trim().length < 5) return err(400, "describe the problem in a sentence or two");
+    // §11: no unattended fan-out — a user tops out at 10 active cases.
+    if ((await activeCaseCount(env.DB, uid)) >= MAX_ACTIVE_CASES_PER_USER) {
+      return err(429, `case limit reached — resolve or pause an open case first (max ${MAX_ACTIVE_CASES_PER_USER} active)`);
+    }
     const { caseId, objective } = await createCaseFromText(env, uid, b.text.trim());
     if (b.scenario) {
       await run(env.DB, `UPDATE cases SET meta = json_set(COALESCE(meta, '{}'), '$.scenario', ?) WHERE id = ?`, b.scenario, caseId);
@@ -235,7 +368,7 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
         caseId,
       );
       if (!pendingRes) {
-        await createApproval(env.DB, caseId, {
+        await createApproval(env, caseId, {
           kind: "confirm_resolution",
           summary: "Your receipt is document-verified. Does this fully resolve the case?",
           detail: { evidenceId, amountCents: cents },
@@ -763,11 +896,35 @@ export async function ingestInboundEmail(
     parsed.references ?? undefined,
     parsed.messageId ?? undefined,
   ]);
-  const caseId = await resolveInboundCase(env.DB, {
+  let caseId = await resolveInboundCase(env.DB, {
     to: parsed.to,
     subject: parsed.subject ?? "",
     messageIds: threadIds,
   });
+  // Forward-to-start: mail to case+new@<domain> from a *verified* account
+  // email becomes a new case. Unverified senders get rejected — the sender
+  // identity must be proven before we trust forwarded content (M7).
+  if (!caseId && /case\+new@/i.test(parsed.to)) {
+    const senderEmail = (parsed.from ?? "").match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/)?.[0]?.toLowerCase();
+    const sender = senderEmail
+      ? await q1<{ id: string; email_verified_at: string | null }>(
+          env.DB,
+          `SELECT id, email_verified_at FROM users WHERE lower(email) = ?`,
+          senderEmail,
+        )
+      : null;
+    if (sender?.email_verified_at && senderEmail) {
+      const { caseId: newId2 } = await createCaseFromText(
+        env, sender.id,
+        `${parsed.subject ? `Fwd: ${parsed.subject}\n\n` : ""}${parsed.body}`.slice(0, 8000),
+      );
+      caseId = newId2;
+      await auditEvent(env.DB, { type: "forward_to_start", severity: "info", userId: sender.id, caseId, data: { from: senderEmail } });
+      await sendSystemEmail(env, senderEmail,
+        `Your forwarded email started a case`,
+        `We opened a case from the email you forwarded. Open Company Service to set what the agent may do:\n\n${env.APP_ORIGIN ?? "https://company-service.agentmasterkey.com"}/#/case/${caseId}\n\n(If you didn't forward this, someone spoofed your address — tell us via the Report abuse page.)`);
+    }
+  }
   if (!caseId) {
     await auditEvent(env.DB, { type: "inbound_unmatched", severity: "warning", data: { to: parsed.to, subject: parsed.subject } });
     return { result: "rejected" };
@@ -839,10 +996,13 @@ async function exportAccount(env: Env, uid: string) {
     ["billing_events", `SELECT * FROM billing_events WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`],
     ["companion_pairings", `SELECT id, user_id, label, created_at, revoked_at FROM companion_pairings WHERE user_id = ?`],
     ["connections", `SELECT id, type, provider, label, status, meta, created_at FROM connections WHERE user_id = ?`],
+    ["notification_prefs", `SELECT id, kind, enabled, updated_at FROM notification_prefs WHERE user_id = ?`],
+    ["user_tokens", `SELECT id, kind, expires_at, used_at, created_at FROM user_tokens WHERE user_id = ?`],
+    ["fraud_signals", `SELECT id, case_id, kind, detail, status, created_at FROM fraud_signals WHERE user_id = ?`],
   ];
   const out: Record<string, unknown> = {
     exportedAt: nowIso(),
-    user: await q1(env.DB, `SELECT id, email, created_at FROM users WHERE id = ?`, uid),
+    user: await q1(env.DB, `SELECT id, email, created_at, email_verified_at, tos_accepted_at FROM users WHERE id = ?`, uid),
   };
   // Tolerate databases missing optional V1 tables (additive migrations are
   // applied per-environment): a missing table exports as [] rather than 500ing
@@ -863,30 +1023,38 @@ async function deleteAccount(env: Env, uid: string, sessionToken: string) {
     );
     for (const k of keys) await env.EVIDENCE.delete(k.r2_key).catch(() => undefined);
   }
-  const del = async (sql: string) => run(env.DB, sql, uid);
-  await del(`DELETE FROM external_messages WHERE conversation_id IN (SELECT id FROM external_conversations WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?))`);
-  await del(`DELETE FROM external_conversations WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
-  await del(`DELETE FROM case_evidence WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
-  await del(`DELETE FROM case_claims WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
-  await del(`DELETE FROM case_actions WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
-  await del(`DELETE FROM case_plans WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
-  await del(`DELETE FROM case_mandates WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
-  await del(`DELETE FROM approval_requests WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
-  await del(`DELETE FROM follow_ups WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
-  await del(`DELETE FROM outcome_events WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
-  await del(`DELETE FROM case_events WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
-  await del(`DELETE FROM cost_events WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
-  await del(`DELETE FROM case_escalations WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
-  await del(`DELETE FROM case_deadlines WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
-  await del(`DELETE FROM companion_pairings WHERE user_id = ?`);
-  await del(`DELETE FROM attestations WHERE user_id = ?`);
-  await del(`DELETE FROM billing_events WHERE user_id = ?`);
-  await del(`DELETE FROM fraud_signals WHERE user_id = ?`);
-  await del(`DELETE FROM cases WHERE user_id = ?`);
-  await del(`DELETE FROM connections WHERE user_id = ?`);
-  await del(`DELETE FROM sessions WHERE user_id = ?`);
-  await del(`DELETE FROM audit_events WHERE user_id = ?`);
-  await run(env.DB, `DELETE FROM users WHERE id = ?`, uid);
+  // All row deletes run as ONE D1 batch: atomic, so no in-flight write can
+  // insert a child row mid-sequence and break the FK ordering, and it's a
+  // single round trip instead of ~25.
+  const stmts = [
+    `DELETE FROM external_messages WHERE conversation_id IN (SELECT id FROM external_conversations WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?))`,
+    `DELETE FROM external_conversations WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`,
+    `DELETE FROM case_evidence WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`,
+    `DELETE FROM case_claims WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`,
+    `DELETE FROM case_actions WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`,
+    `DELETE FROM case_plans WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`,
+    `DELETE FROM case_mandates WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`,
+    `DELETE FROM approval_requests WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`,
+    `DELETE FROM follow_ups WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`,
+    `DELETE FROM outcome_events WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`,
+    `DELETE FROM case_events WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`,
+    `DELETE FROM cost_events WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`,
+    `DELETE FROM case_escalations WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`,
+    `DELETE FROM case_deadlines WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`,
+    `DELETE FROM companion_pairings WHERE user_id = ?`,
+    `DELETE FROM attestations WHERE user_id = ?`,
+    `DELETE FROM billing_events WHERE user_id = ?`,
+    `DELETE FROM fraud_signals WHERE user_id = ?`,
+    `DELETE FROM user_tokens WHERE user_id = ?`,
+    `DELETE FROM notification_prefs WHERE user_id = ?`,
+    `DELETE FROM password_resets WHERE user_id = ?`,
+    `DELETE FROM cases WHERE user_id = ?`,
+    `DELETE FROM connections WHERE user_id = ?`,
+    `DELETE FROM sessions WHERE user_id = ?`,
+    `DELETE FROM audit_events WHERE user_id = ?`,
+    `DELETE FROM users WHERE id = ?`,
+  ].map((sql) => env.DB.prepare(sql).bind(uid));
+  await env.DB.batch(stmts);
   void sessionToken;
 }
 

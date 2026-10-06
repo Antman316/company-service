@@ -39,13 +39,17 @@ export async function signup(db: D1Database, email: string, password: string) {
   if (existing) return { ok: false as const, error: "account already exists" };
   const userId = newId("usr");
   const salt = newId("slt");
+  // OR IGNORE + re-check: email is UNIQUE; a duplicate signup between the
+  // check and insert must report "account already exists", not 500.
   await run(
     db,
-    `INSERT INTO users (id, email, password_hash) VALUES (?,?,?)`,
+    `INSERT OR IGNORE INTO users (id, email, password_hash) VALUES (?,?,?)`,
     userId,
     normalized,
     `${salt}:${await hashPassword(password, salt)}`,
   );
+  const inserted = await q1<{ id: string }>(db, `SELECT id FROM users WHERE email = ?`, normalized);
+  if (!inserted || inserted.id !== userId) return { ok: false as const, error: "account already exists" };
   return { ok: true as const, userId };
 }
 
@@ -58,18 +62,22 @@ export async function signin(db: D1Database, email: string, password: string, se
   const [salt, expected] = user.password_hash.split(":");
   const actual = await hashPassword(password, salt ?? "");
   if (actual !== expected) return { ok: false as const, error: "invalid credentials" };
+  return { ok: true as const, userId: user.id };
+}
+
+// Session issuance split from password verification so callers can insert the
+// TOTP gate between factor one and factor two.
+export async function createSession(db: D1Database, userId: string, secure = true) {
   const token = newId("ses") + newId("tok").slice(4);
   const csrf = newId("csrf");
   const sessionId = newId("s");
   await run(
     db,
     `INSERT INTO sessions (id, user_id, token_hash, csrf_token, expires_at) VALUES (?,?,?,?,?)`,
-    sessionId, user.id, await sha256Hex(token), csrf,
+    sessionId, userId, await sha256Hex(token), csrf,
     new Date(Date.now() + SESSION_TTL_MS).toISOString(),
   );
   return {
-    ok: true as const,
-    userId: user.id,
     token,
     csrf,
     cookie: cookieHeader(token, SESSION_TTL_MS / 1000, secure),

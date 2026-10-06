@@ -12,7 +12,10 @@ export async function proposeAction(
   idempotencyKey: string,
   planId?: string | null,
 ): Promise<string | null> {
-  // Idempotent: same logical action never proposed twice.
+  // Idempotent: same logical action never proposed twice. The check + insert
+  // are separate statements and D1 reads can lag writes across sessions, so
+  // the insert itself is OR IGNORE and the id is re-read afterwards — a
+  // concurrent proposer can never crash the caller with a UNIQUE failure.
   const existing = await q1<{ id: string }>(
     db,
     `SELECT id FROM case_actions WHERE idempotency_key = ?`,
@@ -22,7 +25,7 @@ export async function proposeAction(
   const id = newId("act");
   await run(
     db,
-    `INSERT INTO case_actions (id, case_id, plan_id, kind, payload_json, policy_class, idempotency_key)
+    `INSERT OR IGNORE INTO case_actions (id, case_id, plan_id, kind, payload_json, policy_class, idempotency_key)
      VALUES (?,?,?,?,?,?,?)`,
     id,
     caseId,
@@ -32,7 +35,12 @@ export async function proposeAction(
     "AUTO_ALLOWED",
     idempotencyKey,
   );
-  return id;
+  const row = await q1<{ id: string }>(
+    db,
+    `SELECT id FROM case_actions WHERE idempotency_key = ?`,
+    idempotencyKey,
+  );
+  return row?.id ?? null;
 }
 
 export async function nextProposedAction(db: D1Database, caseId: string) {

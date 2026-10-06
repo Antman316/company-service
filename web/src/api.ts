@@ -19,12 +19,33 @@ export class ApiError extends Error {
   constructor(public status: number, message: string) { super(message); }
 }
 
+export interface MeUser {
+  id: string; email: string; created_at: string;
+  emailVerified: boolean; totpEnabled: boolean; tosAcceptedAt: string | null;
+}
+
 export const api = {
-  me: () => req<{ user: { id: string; email: string } | null; csrf: string }>("/api/auth/me"),
-  signup: (email: string, password: string) =>
-    req<{ ok: boolean; csrf: string }>("/api/auth/signup", { method: "POST", body: JSON.stringify({ email, password }) }),
+  me: () => req<{ user: MeUser | null; csrf: string }>("/api/auth/me"),
+  authConfig: () => req<{ turnstileSiteKey: string | null }>("/api/auth/config"),
+  signup: (email: string, password: string, consent: boolean, turnstile?: string) =>
+    req<{ ok: boolean; csrf: string }>("/api/auth/signup", { method: "POST", body: JSON.stringify({ email, password, consent, turnstile }) }),
   signin: (email: string, password: string) =>
-    req<{ ok: boolean; csrf: string }>("/api/auth/signin", { method: "POST", body: JSON.stringify({ email, password }) }),
+    req<{ ok: boolean; csrf?: string; totpRequired?: boolean; ticket?: string }>("/api/auth/signin", { method: "POST", body: JSON.stringify({ email, password }) }),
+  totpChallenge: (ticket: string, code: string) =>
+    req<{ ok: boolean; csrf: string }>("/api/auth/totp/challenge", { method: "POST", body: JSON.stringify({ ticket, code }) }),
+  requestReset: (email: string) =>
+    req("/api/auth/reset-request", { method: "POST", body: JSON.stringify({ email }) }),
+  confirmReset: (token: string, password: string) =>
+    req("/api/auth/reset-confirm", { method: "POST", body: JSON.stringify({ token, password }) }),
+  resendVerification: () => req("/api/auth/verify-email/resend", { method: "POST" }),
+  totpEnroll: () => req<{ ok: boolean; secret: string; otpauth: string }>("/api/auth/totp/enroll", { method: "POST" }),
+  totpConfirm: (code: string) => req("/api/auth/totp/confirm", { method: "POST", body: JSON.stringify({ code }) }),
+  totpDisable: (code: string) => req("/api/auth/totp/disable", { method: "POST", body: JSON.stringify({ code }) }),
+  notificationPrefs: () => req<{ prefs: Record<string, boolean> }>("/api/notifications/prefs"),
+  setNotificationPref: (kind: string, enabled: boolean) =>
+    req("/api/notifications/prefs", { method: "PUT", body: JSON.stringify({ kind, enabled }) }),
+  reportAbuse: (email: string, caseId: string, body: string) =>
+    req("/api/abuse/report", { method: "POST", body: JSON.stringify({ email, caseId, body }) }),
   signout: () => req("/api/auth/signout", { method: "POST" }),
 
   listCases: () => req<{ cases: any[]; pendingApprovals: number }>("/api/cases"),
