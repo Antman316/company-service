@@ -73,6 +73,17 @@ describe("M3 — escalation ladder (Test Merchant stonewall)", () => {
     expect(draft.toLowerCase()).not.toContain("final answer");
     expect(draft.toLowerCase()).not.toContain("nothing else we can do");
 
+    // Content-identical merchant repeats (the stonewall script sends the same
+    // "final answer" every time) are deduped in the message log AND don't
+    // append duplicate merchant_reply evidence rows — but they still counted
+    // as deflection signals, which is why the ladder reached rung 5.
+    const replyEvidence = (detail.evidence ?? []).filter((e: any) => e.kind === "merchant_reply");
+    expect(replyEvidence.length).toBe(1);
+    const inboundDupes = (detail.events ?? []).filter(
+      (e: any) => e.type === "message_received" && e.data?.duplicate === true,
+    );
+    expect(inboundDupes.length).toBeGreaterThanOrEqual(1);
+
     // Approving materializes the letter + a generated evidence-bundle PDF.
     const dr = await apiPost(c, `/api/approvals/${approval.id}/decide`, { optionId: "approve" });
     expect(dr.status).toBe(200);

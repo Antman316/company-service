@@ -425,7 +425,7 @@ async function sendMerchantMessage(
   // zero bot evasion — and pastes the reply back. That reply re-enters this
   // same ingest pipeline via /assisted/reply.
   if (coverage.assisted) {
-    const msgId = await recordMessage(db, conv, "out", subject, body, "drafted", {
+    const { id: msgId } = await recordMessage(db, conv, "out", subject, body, "drafted", {
       transport: "assisted",
       channel,
       target: coverage.channelAddress ?? "merchant support page",
@@ -449,7 +449,7 @@ async function sendMerchantMessage(
     return { continue: false, status: "WAITING_FOR_CUSTOMER" };
   }
 
-  const outboundMsgId = await recordMessage(db, conv, "out", subject, body, "queued");
+  const { id: outboundMsgId } = await recordMessage(db, conv, "out", subject, body, "queued");
 
   const ctx: ExecutionContext = {
     caseId: caseRow.id,
@@ -576,16 +576,16 @@ export async function recordMessage(
   status: string,
   meta?: Record<string, unknown>,
   externalId?: string | null,
-): Promise<string> {
+): Promise<{ id: string; duplicate: "external_id" | "content" | null }> {
   // Two dedup anchors: provider message-id (exact) and content hash (fallback).
   if (externalId) {
     const byId = await q1<{ id: string }>(db, `SELECT id FROM external_messages WHERE external_id = ?`, externalId);
-    if (byId) return byId.id;
+    if (byId) return { id: byId.id, duplicate: "external_id" };
   }
   const dedup = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${conversationId}:${direction}:${body}`))
     .then((d) => Array.from(new Uint8Array(d)).map((b) => b.toString(16).padStart(2, "0")).join(""));
   const existing = await q1<{ id: string }>(db, `SELECT id FROM external_messages WHERE dedup_hash = ?`, dedup);
-  if (existing) return existing.id;
+  if (existing) return { id: existing.id, duplicate: "content" };
   const id = newId("msg");
   await run(
     db,
@@ -601,7 +601,7 @@ export async function recordMessage(
     dedup,
     externalId ?? null,
   );
-  return id;
+  return { id, duplicate: null };
 }
 
 // ---------------------------------------------------------------------------
@@ -617,7 +617,7 @@ export async function ingestMerchantMessage(
   opts?: { subject?: string; meta?: Record<string, unknown>; externalId?: string | null },
 ): Promise<void> {
   const db = env.DB;
-  await recordMessage(
+  const stored = await recordMessage(
     db,
     conversationId,
     "in",
@@ -627,13 +627,20 @@ export async function ingestMerchantMessage(
     opts?.meta,
     opts?.externalId,
   );
-  await addEvidence(db, env, caseRow.id, {
-    kind: "merchant_reply",
-    text: body,
-    source: "merchant",
-    label: "Merchant reply",
-  });
-  await caseEvent(db, caseRow.id, "message_received", "merchant", { preview: body.slice(0, 200) });
+  // A transport-level retry (same provider Message-ID) adds nothing. A
+  // content-identical repeat is a genuinely new delivery — real deflection
+  // signal — so it still gets analyzed below, but we don't append a second
+  // identical evidence row to the bundle.
+  if (stored.duplicate === "external_id") return;
+  if (stored.duplicate !== "content") {
+    await addEvidence(db, env, caseRow.id, {
+      kind: "merchant_reply",
+      text: body,
+      source: "merchant",
+      label: "Merchant reply",
+    });
+  }
+  await caseEvent(db, caseRow.id, "message_received", "merchant", { preview: body.slice(0, 200), duplicate: stored.duplicate === "content" });
 
   const analysis = await runModel(env, { userId: caseRow.user_id, caseId: caseRow.id }, {
     role: "light",
