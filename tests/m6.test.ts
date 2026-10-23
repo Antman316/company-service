@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { beforeAll, describe, it, expect } from "vitest";
 import { env, SELF } from "cloudflare:test";
 import { apiPost, createTestCase, signup } from "./helpers";
 import { LAUNCH_MERCHANTS, healthCheckDue, runDirectoryHealthCheck } from "../src/adapters/directory";
@@ -18,6 +18,15 @@ async function covRow(id: string) {
 }
 
 describe("M6 merchant directory", () => {
+  beforeAll(async () => {
+    // The local test pool shares D1 between files. Assert seed defaults on
+    // fresh directory fixtures, not lanes verified by an earlier suite.
+    await env.DB.batch([
+      env.DB.prepare("DELETE FROM company_coverage"),
+      env.DB.prepare("DELETE FROM merchant_playbooks"),
+    ]);
+  });
+
   it("seeds all 25 launch merchants with coverage + playbooks, idempotently", async () => {
     await seedRegistry(env.DB);
     const companies = await q<{ id: string }>(env.DB, `SELECT id FROM companies`);
