@@ -49,15 +49,16 @@ export async function dueFollowUps(db: D1Database, limit = 50) {
 // overlapping sweeps could both fire one follow-up. WO-2: the same UPDATE
 // stamps the effect ledger at 'claimed' so a post-claim crash is a distinct
 // persisted state, not silently indistinguishable from a completed send.
-export async function markFired(db: D1Database, id: string): Promise<boolean> {
+export async function markFired(db: D1Database, id: string, claimant?: string): Promise<boolean> {
   const ts = nowIso();
   const r = await run(
     db,
     `UPDATE follow_ups SET status = 'fired', fired_at = ?, attempt = attempt + 1,
-       effect_state = 'claimed', effect_at = ?
+       effect_state = 'claimed', effect_at = ?, claimed_by = ?
      WHERE id = ? AND status = 'pending'`,
     ts,
     ts,
+    claimant ?? null,
     id,
   );
   return (r.meta?.changes ?? 0) > 0;
@@ -68,37 +69,64 @@ export async function markFired(db: D1Database, id: string): Promise<boolean> {
 // retry re-attaches to the same action row instead of duplicating a send.
 const RECOVERABLE_EFFECT_STATES = "('claimed','attempted','accepted','unknown')";
 
+// Lease-exclusion floor: a lease younger than this is live by definition, so
+// no caller-supplied cutoff may steal it. Matches the sweep's recovery grace
+// window — an unrelated claimant only ever sees leases old enough to be
+// genuinely stranded.
+export const RECOVERY_LEASE_MS = 10 * 60 * 1000;
+
+// Effective staleness cutoff: the caller's claimedBeforeIso clamped by the
+// lease-exclusion floor, so even a max-timestamp caller cannot reach a fresh
+// live lease.
+function recoveryCutoff(claimedBeforeIso: string): string {
+  const parsed = Date.parse(claimedBeforeIso);
+  const floor = Date.now() - RECOVERY_LEASE_MS;
+  return new Date(Math.min(Number.isNaN(parsed) ? floor : parsed, floor)).toISOString();
+}
+
 // Lease re-acquire on an already-'fired' row whose effect never reached a
-// terminal state (crash/throw/unknown between claim and completion). Only rows
-// stamped before claimedBeforeIso are eligible — the sweep passes a grace
-// cutoff so it cannot steal a live in-flight attempt; a workflow step retry
-// passes a zero/epoch cutoff because its own prior attempt provably died.
+// terminal state (crash/throw/unknown between claim and completion). Two ways
+// in, either is sufficient:
+//  - provable retry ownership: `claimant` equals the row's claimed_by stamp,
+//    i.e. the same lease holder (e.g. a workflow instance retrying its own
+//    dead attempt — a step only re-runs after its prior invocation ended).
+//  - lease exclusion: the lease is older than RECOVERY_LEASE_MS, so the prior
+//    attempt is provably stale regardless of what claimedBeforeIso says.
+// A caller with no proof of ownership and only a far-future cutoff gets
+// neither — it cannot steal a fresh live lease. Terminal states
+// (reconciled/dismissed) are never recoverable.
 export async function claimForRecovery(
   db: D1Database,
   id: string,
   claimedBeforeIso: string,
+  claimant?: string,
 ): Promise<boolean> {
   const r = await run(
     db,
-    `UPDATE follow_ups SET effect_state = 'claimed', effect_at = ?, attempt = attempt + 1
+    `UPDATE follow_ups SET effect_state = 'claimed', effect_at = ?, attempt = attempt + 1,
+       claimed_by = ?
      WHERE id = ? AND status = 'fired'
        AND effect_state IN ${RECOVERABLE_EFFECT_STATES}
-       AND effect_at < ?`,
+       AND ((claimed_by IS NOT NULL AND claimed_by = ?) OR effect_at < ?)`,
     nowIso(),
+    claimant ?? null,
     id,
-    claimedBeforeIso,
+    claimant ?? null,
+    recoveryCutoff(claimedBeforeIso),
   );
   return (r.meta?.changes ?? 0) > 0;
 }
 
 // Rows claimed whose effect never reconciled — the sweep's recovery backstop.
+// The scan uses the same clamped cutoff as claimForRecovery so a fresh live
+// lease is never enumerated as stranded.
 export async function strandedEffects(db: D1Database, claimedBeforeIso: string, limit = 25) {
   return q<{ id: string; case_id: string; kind: string }>(
     db,
     `SELECT id, case_id, kind FROM follow_ups
      WHERE status = 'fired' AND effect_state IN ${RECOVERABLE_EFFECT_STATES}
        AND effect_at < ? ORDER BY effect_at ASC LIMIT ?`,
-    claimedBeforeIso,
+    recoveryCutoff(claimedBeforeIso),
     limit,
   );
 }
