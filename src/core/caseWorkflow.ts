@@ -33,14 +33,16 @@ export class CaseWorkflow extends WorkflowEntrypoint<Env, FollowUpParams> {
 
     await step.do("fire", async () => {
       // Atomic claim — the cron sweep may have beaten the workflow to it.
-      // WO-2: on a step retry markFired no-ops (status is already 'fired'),
-      // which previously dropped the followUpId and orphaned the claim.
-      // claimForRecovery re-acquires the lease instead: this step only retries
-      // when its own prior attempt provably died, so a max cutoff is safe —
-      // and terminal states (reconciled/dismissed) are never recoverable, so
-      // an effect the sweep already completed cannot be replayed.
-      const firstTry = await markFired(env.DB, followUpId);
-      const claimed = firstTry || (await claimForRecovery(env.DB, followUpId, "9999-12-31T23:59:59.999Z"));
+      // WO-2 correction: markFired stamps this instance as claimed_by. On a
+      // step retry markFired no-ops (status is already 'fired');
+      // claimForRecovery then re-acquires the lease ONLY because claimed_by
+      // equals this instance id — the step only re-runs after its own prior
+      // invocation provably died. A first-attempt callback that lost the
+      // claim holds no such proof: a live sweep's fresh lease is excluded by
+      // the clamped cutoff, and terminal states are never recoverable, so
+      // neither a live claim nor a completed effect can be stolen/replayed.
+      const firstTry = await markFired(env.DB, followUpId, event.instanceId);
+      const claimed = firstTry || (await claimForRecovery(env.DB, followUpId, "9999-12-31T23:59:59.999Z", event.instanceId));
       if (!claimed) return;
       try {
         await runFollowUpFire(env, caseId, fu.kind, followUpId, { reattempt: !firstTry });
