@@ -41,7 +41,13 @@ elsewhere as built.
   10405) — public URL is the custom domain
   `company-service.agentmasterkey.com` on the WGU account zone.
 - `secret:org:CLOUDFLARE_API_TOKEN` is expired for direct REST calls —
-  deploys go through the Cloudflare d10a MCP (multipart script upload).
+  deploys go through the Cloudflare d10a MCP (multipart script upload,
+  base64 staged in a D1 `deploy_stage` table for >~600 KB bundles).
+- **Staging environment VERIFIED 2026-10-06** — `company-service-staging`
+  worker at https://cs-staging.agentmasterkey.com with its own D1
+  (`company-service-db-staging`) + R2 (`company-service-evidence-staging`);
+  `ENVIRONMENT=staging` keeps sim endpoints enabled. Every prod deploy
+  follows `docs/RELEASE_CHECKLIST.md`.
 - SPA is inlined into the worker bundle (`src/static.ts`), not Cloudflare
   Assets — functional, adds ~370 KB to the script; switch to `env.ASSETS`
   once a credential with assets-upload rights exists.
