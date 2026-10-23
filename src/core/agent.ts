@@ -10,7 +10,15 @@ import { createApproval } from "./approvals";
 import { getCase, transitionCase, createCase } from "./caseEngine";
 import { addMs, json, newId, nowIso, q, q1, run } from "./db";
 import { caseEvent, auditEvent } from "./events";
-import { dueFollowUps, markFired, scheduleFollowUp, cancelFollowUps } from "./followups";
+import {
+  cancelFollowUps,
+  claimForRecovery,
+  dueFollowUps,
+  markFired,
+  recordEffect,
+  scheduleFollowUp,
+  strandedEffects,
+} from "./followups";
 import { getActiveMandate } from "./mandate";
 import { latestOutcome, recordOutcome } from "./outcomes";
 import { finalizeResults, receiptState, recordReceipt } from "./results";
@@ -18,6 +26,7 @@ import { describeAction, nextProposedAction, proposeAction } from "./actions";
 import { SpendCapError, bumpCaseSpendCap } from "./spend";
 import { contentCheck, recordFraudSignal } from "./abuse";
 import { notify, sendVerificationEmail, sendSystemEmail } from "./notify";
+import { reportError } from "./ops";
 import { classifyAction, classifyMerchantOffer } from "./policy";
 import {
   addDeadline,
@@ -1043,28 +1052,101 @@ export async function runFollowUpSweep(env: Env): Promise<{ fired: number; deadl
   for (const f of due) {
     const caseRow = await getCase(env.DB, f.case_id);
     if (!caseRow || caseRow.paused || ["RESOLVED", "CANCELLED", "UNRESOLVED", "UNSUPPORTED"].includes(caseRow.status)) {
-      await markFired(env.DB, f.id);
+      // Guard claim — only the claim winner closes the ledger; a 'claimed'
+      // row left undismissed would look stranded to the recovery backstop.
+      if (await markFired(env.DB, f.id)) {
+        await recordEffect(env.DB, f.case_id, f.id, "dismissed", "case missing, paused or terminal — no follow-up sent");
+      }
       continue;
     }
     const mandate = await getActiveMandate(env.DB, f.case_id);
     if (!mandate) {
-      await markFired(env.DB, f.id);
+      if (await markFired(env.DB, f.id)) {
+        await recordEffect(env.DB, f.case_id, f.id, "dismissed", "no active mandate — no follow-up sent");
+      }
       continue;
     }
     // Atomic claim — the workflow path may have already fired this follow-up.
     if (!(await markFired(env.DB, f.id))) continue;
     fired++;
-    await runFollowUpFire(env, f.case_id, f.kind, f.id);
+    try {
+      await runFollowUpFire(env, f.case_id, f.kind, f.id);
+    } catch (e) {
+      // Post-claim failure stays visible: 'unknown' is recoverable (the action
+      // key is idempotent), so the backstop below can reconcile it bounded.
+      await recordEffect(env.DB, f.case_id, f.id, "unknown", e instanceof Error ? e.message : String(e));
+      await reportError(env, e, { route: "cron/followup_sweep", kind: "followup_fire", caseId: f.case_id });
+    }
   }
+  await recoverStrandedEffects(env);
   return { fired, deadlines };
 }
 
+// ---------------------------------------------------------------------------
+// WO-2 recovery backstop: rows claimed whose effect never reached a terminal
+// state (crash/throw between claim and completion) are re-driven once per
+// sweep after a grace window — the cutoff keeps live in-flight attempts from
+// being stolen. Bounded by RECOVERY_ATTEMPT_CAP: at the cap the effect is
+// dismissed for manual reconcile rather than reclaimed forever. Recovery
+// never replays an ambiguous external effect — the deterministic case_actions
+// idempotency key makes a re-run re-attach to the same action row, and the
+// unkeyed customer notify is suppressed on re-attempts.
+// ---------------------------------------------------------------------------
+const RECOVERY_GRACE_MS = 10 * 60 * 1000;
+const RECOVERY_ATTEMPT_CAP = 5;
+const TERMINAL_CASE_STATES = ["RESOLVED", "CANCELLED", "UNRESOLVED", "UNSUPPORTED"];
+
+async function recoverStrandedEffects(env: Env): Promise<void> {
+  const cutoff = addMs(nowIso(), -RECOVERY_GRACE_MS);
+  for (const s of await strandedEffects(env.DB, cutoff)) {
+    const row = await q1<{ attempt: number }>(
+      env.DB,
+      `SELECT attempt FROM follow_ups WHERE id = ?`,
+      s.id,
+    );
+    if ((row?.attempt ?? 0) >= RECOVERY_ATTEMPT_CAP) {
+      await recordEffect(env.DB, s.case_id, s.id, "dismissed", `recovery cap ${RECOVERY_ATTEMPT_CAP} reached — manual reconcile needed`);
+      continue;
+    }
+    if (!(await claimForRecovery(env.DB, s.id, cutoff))) continue;
+    const caseRow = await getCase(env.DB, s.case_id);
+    if (!caseRow || caseRow.paused || TERMINAL_CASE_STATES.includes(caseRow.status) || !(await getActiveMandate(env.DB, s.case_id))) {
+      await recordEffect(env.DB, s.case_id, s.id, "dismissed", "recovered lease — case no longer eligible");
+      continue;
+    }
+    try {
+      await runFollowUpFire(env, s.case_id, s.kind, s.id, { reattempt: true });
+    } catch (e) {
+      await recordEffect(env.DB, s.case_id, s.id, "unknown", e instanceof Error ? e.message : String(e));
+      await reportError(env, e, { route: "cron/followup_sweep", kind: "followup_recover", caseId: s.case_id });
+    }
+  }
+}
+
 // One follow-up fire, shared by the cron sweep and the CaseWorkflow path
-// (M9): the caller has already claimed the row via markFired.
-export async function runFollowUpFire(env: Env, caseId: string, kind: string, followUpId?: string): Promise<void> {
+// (M9): the caller has already claimed the row via markFired (or a bounded
+// claimForRecovery re-lease). WO-2: when followUpId is known, the effect
+// ledger records attempted → accepted → reconciled/dismissed here; a throw
+// before reconciliation is journaled 'unknown' by the caller. `reattempt`
+// marks a recovery re-run — the deterministic action key still re-attaches,
+// but unkeyed customer-facing effects (the money check-in notify) are
+// suppressed so an ambiguous external effect is never blindly replayed.
+export async function runFollowUpFire(
+  env: Env,
+  caseId: string,
+  kind: string,
+  followUpId?: string,
+  opts: { reattempt?: boolean } = {},
+): Promise<void> {
+  const effect = (
+    state: "attempted" | "accepted" | "reconciled" | "dismissed",
+    note?: string,
+  ) => (followUpId ? recordEffect(env.DB, caseId, followUpId, state, note) : Promise.resolve());
+  await effect("attempted");
+
   const caseRow = await getCase(env.DB, caseId);
   // Money check-in: commitment due means the customer should hear about it.
-  if (kind === "check_commitment" && caseRow) {
+  if (kind === "check_commitment" && caseRow && !opts.reattempt) {
     await notify(env, caseRow.user_id, "money_checkin", {
       caseId,
       subject: "Did the money land?",
@@ -1074,15 +1156,19 @@ export async function runFollowUpFire(env: Env, caseId: string, kind: string, fo
 
   const outcome = await latestOutcome(env.DB, caseId);
   if (outcome && ["RECEIVED", "VERIFIED_RESOLVED", "DENIED", "UNRESOLVED"].includes(outcome.status)) {
+    await effect("dismissed", "outcome already terminal — nothing to send");
     return;
   }
 
   await transitionIfAble(env.DB, caseId, "FOLLOW_UP_DUE", "follow-up due");
-  // Propose a follow-up send; the policy engine re-gates it.
+  // Propose a follow-up send; the policy engine re-gates it. The deterministic
+  // key is the idempotency anchor: a recovery re-run finds the same row.
   const key = `${caseId}:followup:${followUpId ?? newId("fup")}`;
   await proposeAction(env.DB, caseId, "send_followup", { followUpId }, key);
+  await effect("accepted", key);
   await transitionIfAble(env.DB, caseId, "IN_PROGRESS", "processing follow-up");
   await advanceCase(env, caseId, `followup:${followUpId ?? "wf"}`);
+  await effect("reconciled", key);
 }
 
 // ---------------------------------------------------------------------------

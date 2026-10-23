@@ -1,6 +1,6 @@
 import { WorkflowEntrypoint, WorkflowEvent, WorkflowStep } from "cloudflare:workers";
 import { q1 } from "./db";
-import { markFired } from "./followups";
+import { markFired, claimForRecovery, recordEffect } from "./followups";
 import { runFollowUpFire } from "./agent";
 import { reportError } from "./ops";
 
@@ -33,10 +33,19 @@ export class CaseWorkflow extends WorkflowEntrypoint<Env, FollowUpParams> {
 
     await step.do("fire", async () => {
       // Atomic claim — the cron sweep may have beaten the workflow to it.
-      if (!(await markFired(env.DB, followUpId))) return;
+      // WO-2: on a step retry markFired no-ops (status is already 'fired'),
+      // which previously dropped the followUpId and orphaned the claim.
+      // claimForRecovery re-acquires the lease instead: this step only retries
+      // when its own prior attempt provably died, so a max cutoff is safe —
+      // and terminal states (reconciled/dismissed) are never recoverable, so
+      // an effect the sweep already completed cannot be replayed.
+      const firstTry = await markFired(env.DB, followUpId);
+      const claimed = firstTry || (await claimForRecovery(env.DB, followUpId, "9999-12-31T23:59:59.999Z"));
+      if (!claimed) return;
       try {
-        await runFollowUpFire(env, caseId, fu.kind);
+        await runFollowUpFire(env, caseId, fu.kind, followUpId, { reattempt: !firstTry });
       } catch (e) {
+        await recordEffect(env.DB, caseId, followUpId, "unknown", e instanceof Error ? e.message : String(e));
         await reportError(env, e, { route: "workflow/fire", kind: "case_workflow", caseId });
         throw e; // let the workflow's own retry policy handle it
       }
