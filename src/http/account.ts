@@ -90,14 +90,18 @@ export async function requestPasswordReset(env: Env, email: string): Promise<voi
 
 export async function confirmPasswordReset(env: Env, token: string, newPassword: string): Promise<{ ok: boolean; error?: string }> {
   if (newPassword.length < 8) return { ok: false, error: "password must be at least 8 characters" };
-  const row = await q1<{ id: string; user_id: string; expires_at: string; used_at: string | null }>(
+  const tokenHash = await sha256Hex(token);
+  // Cheap preflight avoids doing PBKDF2 work for obviously invalid tokens. The
+  // security decision is the conditional UPDATE ... RETURNING below.
+  const candidate = await q1<{ id: string }>(
     env.DB,
-    `SELECT id, user_id, expires_at, used_at FROM password_resets WHERE token_hash = ?`,
-    await sha256Hex(token),
+    `SELECT id FROM password_resets
+     WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?`,
+    tokenHash,
+    new Date().toISOString(),
   );
-  if (!row || row.used_at || new Date(row.expires_at).getTime() < Date.now()) {
-    return { ok: false, error: "reset link is invalid or expired" };
-  }
+  if (!candidate) return { ok: false, error: "reset link is invalid or expired" };
+
   // Reuse the auth module's hashing via the same format (salt:hex@pbkdf2-100k).
   const salt = newId("slt");
   const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(newPassword), "PBKDF2", false, ["deriveBits"]);
@@ -107,11 +111,27 @@ export async function confirmPasswordReset(env: Env, token: string, newPassword:
     256,
   );
   const hash = Array.from(new Uint8Array(bits)).map((b) => b.toString(16).padStart(2, "0")).join("");
-  await run(env.DB, `UPDATE users SET password_hash = ? WHERE id = ?`, `${salt}:${hash}`, row.user_id);
-  await run(env.DB, `UPDATE password_resets SET used_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`, row.id);
-  // Reset kills every session — a stolen cookie must not survive it.
-  await run(env.DB, `DELETE FROM sessions WHERE user_id = ?`, row.user_id);
-  await auditEvent(env.DB, { type: "password_reset_completed", severity: "info", userId: row.user_id });
+
+  // Atomically claim the one-shot token. Concurrent requests may both pass the
+  // read-only preflight, but exactly one can transition used_at from NULL.
+  const now = new Date().toISOString();
+  const claimed = await env.DB
+    .prepare(
+      `UPDATE password_resets
+       SET used_at = ?
+       WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?
+       RETURNING user_id`,
+    )
+    .bind(now, tokenHash, now)
+    .first<{ user_id: string }>();
+  if (!claimed) return { ok: false, error: "reset link is invalid or expired" };
+
+  await env.DB.batch([
+    env.DB.prepare(`UPDATE users SET password_hash = ? WHERE id = ?`).bind(`${salt}:${hash}`, claimed.user_id),
+    // Reset kills every session — a stolen cookie must not survive it.
+    env.DB.prepare(`DELETE FROM sessions WHERE user_id = ?`).bind(claimed.user_id),
+  ]);
+  await auditEvent(env.DB, { type: "password_reset_completed", severity: "info", userId: claimed.user_id });
   return { ok: true };
 }
 
@@ -120,28 +140,32 @@ export async function confirmPasswordReset(env: Env, token: string, newPassword:
 // enforces only 'enc:' secrets.
 // ---------------------------------------------------------------------------
 
-async function totpSecretState(env: Env, userId: string): Promise<{ state: "off" | "pending" | "on"; secret?: string }> {
+async function totpSecretState(env: Env, userId: string): Promise<{ state: "off" | "pending" | "on" | "error"; secret?: string }> {
   const row = await q1<{ totp_secret_enc: string | null }>(env.DB, `SELECT totp_secret_enc FROM users WHERE id = ?`, userId);
   const v = row?.totp_secret_enc;
-  if (!v || !env.SECRET_KEY) return { state: "off" };
+  if (!v) return { state: "off" };
+  // An enabled/pending secret with a missing or unusable encryption key must
+  // fail closed. Treating decrypt failure as "off" silently bypasses factor 2.
+  if (!env.SECRET_KEY) return { state: "error" };
   if (v.startsWith("pending:")) {
     try {
       const { s } = await decryptJson<{ s: string }>(v.slice(8), env.SECRET_KEY);
       return { state: "pending", secret: s };
-    } catch { return { state: "off" }; }
+    } catch { return { state: "error" }; }
   }
   if (v.startsWith("enc:")) {
     try {
       const { s } = await decryptJson<{ s: string }>(v.slice(4), env.SECRET_KEY);
       return { state: "on", secret: s };
-    } catch { return { state: "off" }; }
+    } catch { return { state: "error" }; }
   }
-  return { state: "off" };
+  return { state: "error" };
 }
 
 export async function totpEnroll(env: Env, userId: string): Promise<{ ok: boolean; secret?: string; otpauth?: string; error?: string }> {
   if (!env.SECRET_KEY) return { ok: false, error: "2FA unavailable — encryption key not configured" };
   const st = await totpSecretState(env, userId);
+  if (st.state === "error") return { ok: false, error: "2FA state unavailable — contact support" };
   if (st.state === "on") return { ok: false, error: "2FA already enabled" };
   const secret = generateTotpSecret();
   await run(
@@ -157,6 +181,7 @@ export async function totpEnroll(env: Env, userId: string): Promise<{ ok: boolea
 export async function totpConfirm(env: Env, userId: string, code: string): Promise<{ ok: boolean; error?: string }> {
   if (!env.SECRET_KEY) return { ok: false, error: "2FA unavailable — encryption key not configured" };
   const st = await totpSecretState(env, userId);
+  if (st.state === "error") return { ok: false, error: "2FA state unavailable — contact support" };
   if (st.state !== "pending" || !st.secret) return { ok: false, error: "no enrollment in progress" };
   if (!(await verifyTotp(st.secret, code))) return { ok: false, error: "code didn't match — check your authenticator clock" };
   await run(
@@ -171,6 +196,7 @@ export async function totpConfirm(env: Env, userId: string, code: string): Promi
 
 export async function totpDisable(env: Env, userId: string, code: string): Promise<{ ok: boolean; error?: string }> {
   const st = await totpSecretState(env, userId);
+  if (st.state === "error") return { ok: false, error: "2FA state unavailable — contact support" };
   if (st.state !== "on" || !st.secret) return { ok: false, error: "2FA is not enabled" };
   if (!(await verifyTotp(st.secret, code))) return { ok: false, error: "code didn't match" };
   await run(env.DB, `UPDATE users SET totp_secret_enc = NULL WHERE id = ?`, userId);
@@ -182,6 +208,7 @@ export async function totpDisable(env: Env, userId: string, code: string): Promi
 // Called by the signin route after the password verifies.
 export async function totpChallengeFor(env: Env, userId: string): Promise<{ required: boolean; ticket?: string }> {
   const st = await totpSecretState(env, userId);
+  if (st.state === "error") throw new Error("2FA state unavailable");
   if (st.state !== "on") return { required: false };
   const ticket = await issueUserToken(env.DB, userId, "totp_challenge", TOTP_CHALLENGE_TTL_MS);
   return { required: true, ticket };
@@ -191,6 +218,7 @@ export async function totpChallengeRedeem(env: Env, ticket: string, code: string
   const hit = await consumeUserToken(env.DB, ticket, "totp_challenge");
   if (!hit) return { ok: false, error: "challenge expired — sign in again" };
   const st = await totpSecretState(env, hit.userId);
+  if (st.state === "error") return { ok: false, error: "2FA state unavailable — sign in again later" };
   if (st.state !== "on" || !st.secret) return { ok: false, error: "2FA state changed — sign in again" };
   if (!(await verifyTotp(st.secret, code))) return { ok: false, error: "code didn't match" };
   return { ok: true, userId: hit.userId };

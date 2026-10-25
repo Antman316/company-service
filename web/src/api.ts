@@ -44,6 +44,8 @@ export const api = {
   notificationPrefs: () => req<{ prefs: Record<string, boolean> }>("/api/notifications/prefs"),
   setNotificationPref: (kind: string, enabled: boolean) =>
     req("/api/notifications/prefs", { method: "PUT", body: JSON.stringify({ kind, enabled }) }),
+  confirmForwardStart: (token: string) =>
+    req<{ ok: boolean; caseId: string }>("/api/forward-start/confirm", { method: "POST", body: JSON.stringify({ token }) }),
   reportAbuse: (email: string, caseId: string, body: string) =>
     req("/api/abuse/report", { method: "POST", body: JSON.stringify({ email, caseId, body }) }),
   signout: () => req("/api/auth/signout", { method: "POST" }),

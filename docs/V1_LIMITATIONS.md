@@ -120,11 +120,11 @@ elsewhere as built.
   is parsed from the document text when possible, else customer-entered; the
   parsed figure is not itself verified against a bank feed (no Plaid in V1).
 - ~~No 2FA, no email verification, no password reset~~ — **done (M7)**:
-  email verification (required before any real-channel outbound send and
-  before forward-to-start trusts the sender), password reset via one-time
-  mailed link, and optional TOTP 2FA are all implemented. System mail goes
-  through MAILOUT→Resend→dev_log — it never uses a customer's case
-  connection. Unverified accounts can still create cases and use the
+  email verification (required before any real-channel outbound send), password
+  reset via an atomically claimed one-time mailed link, and optional TOTP 2FA
+  are implemented. TOTP fails closed if its encrypted secret cannot be read.
+  System mail goes through MAILOUT→Resend→dev_log — it never uses a customer's
+  case connection. Unverified accounts can still create cases and use the
   deterministic local intake; real sends + non-local model calls are gated.
 - Spend caps (§11) IMPLEMENTED: per-case soft cap ($0.50 default → pause +
   approval to continue), per-user daily ($5), global daily ($100) — all in
@@ -142,10 +142,13 @@ elsewhere as built.
   at public hash routes, with a consent checkbox at signup
   (`tos_accepted_at`). The ship gate still requires a lawyer's pass on
   template + terms wording.
-- Forward-to-start IMPLEMENTED: mail to `case+new@<domain>` from a
-  verified account email creates a case; unverified or unknown senders
-  are rejected. Spoofing a *from* header is easy — the case is created in
-  the matched account, not the spoofer's, which limits the blast radius.
+- Forward-to-start is **confirmation-gated**: a matching `From` header never
+  creates a case by itself because Email Workers do not expose a stable trusted
+  SPF/DKIM/DMARC verdict here. A verified account receives a one-hour link; no
+  case opens until that same account signs in and confirms. Unknown senders are
+  rejected, confirmations are rate-limited, and tokens are atomically one-shot.
+  The confirmation payload carries subject/body only; forwarded attachments
+  must be uploaded after the case opens.
 - ~~Export/delete-account endpoints not shipped~~ — **done**:
   `/api/account/export` (13-table dump) + `/api/account/delete`
   (R2 + full cascade incl. sessions), connection revoke wipes credentials,
