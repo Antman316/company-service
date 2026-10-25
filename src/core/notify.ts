@@ -123,15 +123,22 @@ export async function consumeUserToken(
   db: D1Database,
   token: string,
   kind: string,
+  expectedUserId?: string,
 ): Promise<{ userId: string; payload: Record<string, unknown> } | null> {
-  const row = await q1<{ id: string; user_id: string; payload_json: string | null; expires_at: string; used_at: string | null }>(
-    db,
-    `SELECT id, user_id, payload_json, expires_at, used_at FROM user_tokens WHERE token_hash = ? AND kind = ?`,
-    await sha256Hex(token),
-    kind,
-  );
-  if (!row || row.used_at || new Date(row.expires_at).getTime() < Date.now()) return null;
-  await run(db, `UPDATE user_tokens SET used_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`, row.id);
+  // Claim in one conditional write. A SELECT followed by an unconditional
+  // UPDATE lets concurrent redeemers both observe used_at=NULL and both win.
+  const now = new Date().toISOString();
+  const row = await db
+    .prepare(
+      `UPDATE user_tokens
+       SET used_at = ?
+       WHERE token_hash = ? AND kind = ? AND used_at IS NULL AND expires_at > ?
+         ${expectedUserId ? "AND user_id = ?" : ""}
+       RETURNING user_id, payload_json`,
+    )
+    .bind(now, await sha256Hex(token), kind, now, ...(expectedUserId ? [expectedUserId] : []))
+    .first<{ user_id: string; payload_json: string | null }>();
+  if (!row) return null;
   let payload: Record<string, unknown> = {};
   try { payload = JSON.parse(row.payload_json ?? "{}"); } catch { /* ignore */ }
   return { userId: row.user_id, payload };

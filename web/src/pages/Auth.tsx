@@ -5,7 +5,7 @@ declare const turnstile: any;
 
 type Mode = "signin" | "signup" | "totp" | "reset" | "resetConfirm";
 
-export function Auth({ onDone, initialMode }: { onDone: () => void; initialMode?: Mode }) {
+export function Auth({ onDone, initialMode, returnTo }: { onDone: () => void; initialMode?: Mode; returnTo?: string }) {
   const [mode, setMode] = useState<Mode>(initialMode ?? "signup");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -56,7 +56,7 @@ export function Auth({ onDone, initialMode }: { onDone: () => void; initialMode?
         const r = await api.signup(email, password, consent, tsToken ?? undefined);
         setCsrf(r.csrf);
         onDone();
-        location.hash = "/app";
+        location.hash = returnTo ?? "/app";
       } else if (mode === "signin") {
         const r = await api.signin(email, password);
         if (r.totpRequired && r.ticket) {
@@ -64,13 +64,13 @@ export function Auth({ onDone, initialMode }: { onDone: () => void; initialMode?
         } else {
           setCsrf(r.csrf ?? null);
           onDone();
-          location.hash = "/app";
+          location.hash = returnTo ?? "/app";
         }
       } else if (mode === "totp") {
         const r = await api.totpChallenge(ticket!, code);
         setCsrf(r.csrf);
         onDone();
-        location.hash = "/app";
+        location.hash = returnTo ?? "/app";
       } else if (mode === "reset") {
         await api.requestReset(email);
         setNotice("If that email has an account, a reset link is on its way.");

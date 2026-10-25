@@ -30,7 +30,7 @@ import {
   resendVerification, setNotificationPref, totpChallengeFor, totpChallengeRedeem,
   totpConfirm, totpDisable, totpEnroll, verifyEmailLink,
 } from "./http/account";
-import { sendVerificationEmail, sendSystemEmail } from "./core/notify";
+import { consumeUserToken, countRecentTokens, issueUserToken, sendVerificationEmail, sendSystemEmail } from "./core/notify";
 import { healthCheckDue, runDirectoryHealthCheck } from "./adapters/directory";
 import { backupDue, inboundRawKey, reportError, runDailyBackup } from "./core/ops";
 import type { InboundQueueMessage } from "./core/ops";
@@ -222,6 +222,36 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
     const r = await setNotificationPref(env, uid, b.kind ?? "", b.enabled === true);
     if (!r.ok) return err(400, r.error ?? "pref failed");
     return res({ ok: true });
+  }
+  if (path === "/api/forward-start/confirm" && req.method === "POST") {
+    if ((await activeCaseCount(env.DB, uid)) >= MAX_ACTIVE_CASES_PER_USER) {
+      return err(429, `case limit reached — resolve or pause an open case first (max ${MAX_ACTIVE_CASES_PER_USER} active)`);
+    }
+    const b = (await req.json()) as { token?: string };
+    const hit = await consumeUserToken(env.DB, b.token ?? "", "forward_start", uid);
+    const subject = typeof hit?.payload.subject === "string" ? hit.payload.subject : "";
+    const body = typeof hit?.payload.body === "string" ? hit.payload.body : "";
+    if (!hit || body.trim().length < 5) return err(400, "confirmation link is invalid or expired");
+    const create = await createCaseFromText(
+      env,
+      uid,
+      `${subject ? `Fwd: ${subject}\n\n` : ""}${body}`.slice(0, 8000),
+    );
+    await ingestInboundText(env, create.caseId, body, {
+      subject,
+      externalId: typeof hit.payload.messageId === "string" ? hit.payload.messageId : null,
+      meta: {
+        channel: "email",
+        from: typeof hit.payload.from === "string" ? hit.payload.from : "",
+        to: typeof hit.payload.to === "string" ? hit.payload.to : "",
+        confirmation: "signed_in_account_holder",
+      },
+    });
+    await auditEvent(env.DB, {
+      type: "forward_to_start_confirmed", severity: "info", userId: uid, caseId: create.caseId,
+      data: { messageId: hit.payload.messageId ?? null },
+    });
+    return res({ ok: true, caseId: create.caseId });
   }
 
   // Owner-only per-case results detail (M4). Gated by ADMIN_EMAILS binding
@@ -875,8 +905,8 @@ export interface InboundParsed {
 // queue producer can decide "queueable vs bounce" without creating a case.
 async function forwardNewSender(env: Env, parsed: InboundParsed): Promise<{ id: string; email: string } | null> {
   if (!/case\+new@/i.test(parsed.to)) return null;
-  const senderEmail = (parsed.from ?? "").match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/)?.[0]?.toLowerCase();
-  if (!senderEmail) return null;
+  const senderEmail = (parsed.from ?? "").trim().toLowerCase();
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(senderEmail)) return null;
   const sender = await q1<{ id: string; email_verified_at: string | null }>(
     env.DB,
     `SELECT id, email_verified_at FROM users WHERE lower(email) = ?`,
@@ -885,13 +915,53 @@ async function forwardNewSender(env: Env, parsed: InboundParsed): Promise<{ id: 
   return sender?.email_verified_at ? { id: sender.id, email: senderEmail } : null;
 }
 
+async function sendForwardStartConfirmation(
+  env: Env,
+  sender: { id: string; email: string },
+  parsed: InboundParsed,
+): Promise<boolean> {
+  // A spoofed From header must not become an email-bomb primitive. Bound the
+  // number of pending confirmations sent to one account.
+  if ((await countRecentTokens(env.DB, sender.id, "forward_start", 3600_000)) >= 3) {
+    await auditEvent(env.DB, {
+      type: "forward_start_confirmation_limited", severity: "warning", userId: sender.id,
+      data: { from: parsed.from ?? "", to: parsed.to },
+    });
+    return false;
+  }
+  const token = await issueUserToken(env.DB, sender.id, "forward_start", 3600_000, {
+    subject: (parsed.subject ?? "").slice(0, 500),
+    body: parsed.body.slice(0, 8000),
+    from: (parsed.from ?? "").slice(0, 320),
+    to: parsed.to.slice(0, 320),
+    messageId: parsed.messageId ?? null,
+  });
+  const origin = env.APP_ORIGIN ?? `https://${env.EMAIL_DOMAIN ?? "agentmasterkey.com"}`;
+  const link = `${origin}/#/forward-confirm?token=${encodeURIComponent(token)}`;
+  const sent = await sendSystemEmail(
+    env,
+    sender.email,
+    "Confirm your forwarded email to start a case",
+    `We received a message claiming to be from your address. No case was created.\n\nIf you sent it, sign in and confirm within 1 hour:\n\n${link}\n\nIf you did not send it, ignore this email.`,
+  );
+  await auditEvent(env.DB, {
+    type: "forward_start_confirmation_sent", severity: sent.ok ? "info" : "warning",
+    userId: sender.id,
+    data: {
+      transport: sent.transport, ok: sent.ok,
+      ...(env.ENVIRONMENT !== "production" ? { devToken: token } : {}),
+    },
+  });
+  return sent.ok;
+}
+
 // Cheap synchronous preflight shared by the email() producer and the queue
 // consumer's full ingest: domain guard, message-id dedup, case resolution,
 // forward-to-start eligibility. No writes beyond audit rows.
 async function preflightInbound(
   env: Env,
   parsed: InboundParsed,
-): Promise<{ result: "rejected" | "duplicate" | "ok"; caseId?: string; forwardSender?: { id: string; email: string } }> {
+): Promise<{ result: "rejected" | "duplicate" | "confirmation_required" | "ok"; caseId?: string; forwardSender?: { id: string; email: string } }> {
   const inboundDomain = env.INBOUND_ADDRESS?.split("@")[1] ?? env.EMAIL_DOMAIN ?? "agentmasterkey.com";
   if (!parsed.to.toLowerCase().endsWith(`@${inboundDomain}`)) {
     await auditEvent(env.DB, { type: "inbound_wrong_domain", severity: "warning", data: { to: parsed.to } });
@@ -922,7 +992,10 @@ async function preflightInbound(
   });
   if (caseId) return { result: "ok", caseId };
   const forwardSender = await forwardNewSender(env, parsed);
-  if (forwardSender) return { result: "ok", forwardSender };
+  // Cloudflare Email Workers do not expose a stable, trusted SPF/DKIM/DMARC
+  // verdict to this code path. A matching From header alone is spoofable, so
+  // fail safe: create no case until the signed-in account holder confirms.
+  if (forwardSender) return { result: "confirmation_required", forwardSender };
   await auditEvent(env.DB, { type: "inbound_unmatched", severity: "warning", data: { to: parsed.to, subject: parsed.subject } });
   return { result: "rejected" };
 }
@@ -932,28 +1005,13 @@ export async function ingestInboundEmail(
   parsed: InboundParsed,
 ): Promise<{ result: string; caseId?: string }> {
   const pre = await preflightInbound(env, parsed);
+  if (pre.result === "confirmation_required" && pre.forwardSender) {
+    const sent = await sendForwardStartConfirmation(env, pre.forwardSender, parsed);
+    return { result: sent ? "confirmation_sent" : "confirmation_limited" };
+  }
   if (pre.result !== "ok") return { result: pre.result };
 
-  let caseId = pre.caseId;
-  // Forward-to-start: mail to case+new@<domain> from a *verified* account
-  // email becomes a new case. Unverified senders were already rejected by
-  // preflight — the sender identity must be proven before we trust
-  // forwarded content (M7).
-  if (!caseId && pre.forwardSender) {
-    const sender = pre.forwardSender;
-    {
-      const senderEmail = sender.email;
-      const create = await createCaseFromText(
-        env, sender.id,
-        `${parsed.subject ? `Fwd: ${parsed.subject}\n\n` : ""}${parsed.body}`.slice(0, 8000),
-      );
-      caseId = create.caseId;
-      await auditEvent(env.DB, { type: "forward_to_start", severity: "info", userId: sender.id, caseId, data: { from: senderEmail } });
-      await sendSystemEmail(env, senderEmail,
-        `Your forwarded email started a case`,
-        `We opened a case from the email you forwarded. Open Company Service to set what the agent may do:\n\n${env.APP_ORIGIN ?? "https://company-service.agentmasterkey.com"}/#/case/${caseId}\n\n(If you didn't forward this, someone spoofed your address — tell us via the Report abuse page.)`);
-    }
-  }
+  const caseId = pre.caseId;
   if (!caseId) {
     await auditEvent(env.DB, { type: "inbound_unmatched", severity: "warning", data: { to: parsed.to, subject: parsed.subject } });
     return { result: "rejected" };
@@ -1159,6 +1217,10 @@ export default {
       const rawBytes = await new Response(message.raw).arrayBuffer();
       const parsed = await parseInboundRaw(rawBytes, message.to ?? "");
       const pre = await preflightInbound(env, parsed);
+      if (pre.result === "confirmation_required" && pre.forwardSender) {
+        await sendForwardStartConfirmation(env, pre.forwardSender, parsed);
+        return;
+      }
       if (pre.result === "rejected") { message.setReject("no matching case"); return; }
       if (pre.result === "duplicate") return;
 

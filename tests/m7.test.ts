@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import { env, SELF } from "cloudflare:test";
 import { apiGet, apiPost, authed, createTestCase, getCaseDetail, grantMandate, signup } from "./helpers";
 import { runFollowUpSweep } from "../src/core/agent";
+import { ingestInboundEmail } from "../src/index";
 import { contentCheck } from "../src/core/abuse";
 import { totpNow } from "../src/core/totp";
 import { encryptJson } from "../src/security/crypto";
@@ -118,6 +119,74 @@ describe("M7 account, trust & legal", () => {
     expect(rc2.status).toBe(400);
   });
 
+  it("password reset token has one atomic winner under concurrency", async () => {
+    const email = `rst-race-${Date.now()}@t.dev`;
+    await signup(email);
+    const rq = await SELF.fetch("http://test/api/auth/reset-request", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email }),
+    });
+    expect(rq.status).toBe(200);
+    const sent = await latestAudit("password_reset_sent");
+    const redeem = (password: string) => SELF.fetch("http://test/api/auth/reset-confirm", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: sent.devToken, password }),
+    });
+    const passwords = Array.from({ length: 8 }, (_, i) => `race-password-${i}-99`);
+    const attempts = await Promise.all(passwords.map((password) => redeem(password)));
+    expect(attempts.filter((r) => r.status === 200)).toHaveLength(1);
+    expect(attempts.filter((r) => r.status === 400)).toHaveLength(passwords.length - 1);
+
+    const signinWith = (password: string) => SELF.fetch("http://test/api/auth/signin", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password }),
+    });
+    const signins = await Promise.all(passwords.map((password) => signinWith(password)));
+    expect(signins.filter((r) => r.status === 200)).toHaveLength(1);
+    expect(signins.filter((r) => r.status === 401)).toHaveLength(passwords.length - 1);
+  });
+
+  it("forward-to-start requires signed-in account confirmation without trusted sender auth", async () => {
+    const email = `forward-victim-${Date.now()}@example.com`;
+    const c = await signup(email);
+    const me = await apiGet(c, "/api/auth/me");
+    await env.DB.prepare(
+      `UPDATE users SET email_verified_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`,
+    ).bind(me.body.user.id).run();
+    const inboundDomain = (env.INBOUND_ADDRESS ?? `cases@${env.EMAIL_DOMAIN ?? "agentmasterkey.com"}`).split("@")[1];
+    const received = await ingestInboundEmail(env, {
+      to: `case+new@${inboundDomain}`,
+      from: email,
+      subject: "untrusted forwarded order",
+      body: "This content arrived without a trustworthy aligned sender-auth verdict.",
+      messageId: `<forward-${Date.now()}@attacker.invalid>`,
+    });
+    expect(received.result).toBe("confirmation_sent");
+    const before = await env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM cases WHERE user_id = ?`,
+    ).bind(me.body.user.id).first<{ n: number }>();
+    expect(before?.n ?? 0).toBe(0);
+
+    const sent = await latestAudit("forward_start_confirmation_sent", me.body.user.id);
+    expect(sent.devToken).toMatch(/^cs_for_/);
+    const other = await signup(`forward-other-${Date.now()}@example.com`);
+    const wrongAccount = await apiPost(other, "/api/forward-start/confirm", { token: sent.devToken });
+    expect(wrongAccount.status).toBe(400);
+    const confirm = await apiPost(c, "/api/forward-start/confirm", { token: sent.devToken });
+    expect(confirm.status).toBe(200);
+    expect(confirm.body.caseId).toMatch(/^case_/);
+    const after = await env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM cases WHERE user_id = ?`,
+    ).bind(me.body.user.id).first<{ n: number }>();
+    expect(after?.n ?? 0).toBe(1);
+
+    const replay = await apiPost(c, "/api/forward-start/confirm", { token: sent.devToken });
+    expect(replay.status).toBe(400);
+  });
+
   it("TOTP: enroll → confirm → signin requires challenge → disable", async () => {
     const email = `totp-${Date.now()}@t.dev`;
     const c = await signup(email);
@@ -163,19 +232,37 @@ describe("M7 account, trust & legal", () => {
       body: JSON.stringify({ email, password: "password-1234" }),
     });
     const s2b = await s2.json() as { ticket?: string };
-    const ch2 = await SELF.fetch("http://test/api/auth/totp/challenge", {
+    const liveCode = await totpNow(secret);
+    const redeemChallenge = () => SELF.fetch("http://test/api/auth/totp/challenge", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ticket: s2b.ticket, code: await totpNow(secret) }),
+      body: JSON.stringify({ ticket: s2b.ticket, code: liveCode }),
     });
-    expect(ch2.status).toBe(200);
-    expect(ch2.headers.get("set-cookie")).toContain("cs_session=");
+    const [ch2a, ch2b] = await Promise.all([redeemChallenge(), redeemChallenge()]);
+    expect([ch2a.status, ch2b.status].sort()).toEqual([200, 401]);
+    const successfulChallenge = ch2a.status === 200 ? ch2a : ch2b;
+    expect(successfulChallenge.headers.get("set-cookie")).toContain("cs_session=");
 
     // Disable requires a live code.
     const dis = await apiPost(c, "/api/auth/totp/disable", { code: await totpNow(secret) });
     expect(dis.status).toBe(200);
     const me2 = await apiGet(c, "/api/auth/me");
     expect(me2.body.user.totpEnabled).toBe(false);
+  });
+
+  it("TOTP fails closed when an enabled secret cannot be decrypted", async () => {
+    const email = `totp-corrupt-${Date.now()}@t.dev`;
+    const c = await signup(email);
+    const me = await apiGet(c, "/api/auth/me");
+    await env.DB.prepare(`UPDATE users SET totp_secret_enc = 'enc:corrupt-ciphertext' WHERE id = ?`)
+      .bind(me.body.user.id).run();
+    const signin = await SELF.fetch("http://test/api/auth/signin", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password: "password-1234" }),
+    });
+    expect(signin.status).toBe(500);
+    expect(signin.headers.get("set-cookie")).toBeNull();
   });
 
   it("notification prefs: default on, opt-out suppresses send", async () => {

@@ -7,6 +7,7 @@ ALTER TABLE users ADD COLUMN tos_accepted_at TEXT;
 -- Generic one-shot tokens for flows that aren't password resets:
 --   kind='email_verify'     — verify-email links (TTL 24h)
 --   kind='totp_challenge'   — post-password 2FA challenge tickets (TTL 5min)
+--   kind='forward_start'    — signed-in confirmation for forwarded intake (TTL 1h)
 -- Password resets keep their dedicated 0004 table.
 CREATE TABLE IF NOT EXISTS user_tokens (
   id          TEXT PRIMARY KEY,

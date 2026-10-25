@@ -10,6 +10,7 @@ import { Connections } from "./pages/Connections";
 import { Economics } from "./pages/Economics";
 import { Results } from "./pages/Results";
 import { Terms, Privacy, HowItWorks, Disclaimer, VerifyResult, ReportAbuse } from "./pages/Legal";
+import { ForwardStartConfirm } from "./pages/ForwardStart";
 
 // Hash router — simplest reliable SPA routing behind static assets.
 export function useRoute(): [string, (to: string) => void] {
@@ -56,7 +57,9 @@ export function App() {
   else if (base === "/verified") page = <VerifyResult ok />;
   else if (base === "/verify-failed") page = <VerifyResult ok={false} />;
   else if (base === "/report") page = <ReportAbuse />;
-  else if (!authed) {
+  else if (base === "/forward-confirm") {
+    page = authed ? <ForwardStartConfirm nav={nav} /> : <Auth onDone={refreshMe} initialMode="signin" returnTo={route} />;
+  } else if (!authed) {
     if (base === "/reset") page = <Auth onDone={refreshMe} initialMode="resetConfirm" />;
     else if (base === "/auth") page = <Auth onDone={refreshMe} />;
     else page = <Landing onCta={() => nav("/auth")} />;

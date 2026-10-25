@@ -13,6 +13,9 @@ injection, (b) a compromised model provider producing out-of-policy actions,
 - **Auth:** email+password signup/signin; PBKDF2-SHA256 (100k iterations —
   Workers WebCrypto cap), per-user salt; HttpOnly `Secure` `SameSite=Strict`
   session cookie, 30-day expiry; session row stores only `sha256(token)`.
+  Signup records consent, email verification gates real sends/non-local models,
+  password-reset and generic user tokens are atomically one-shot, and optional
+  encrypted TOTP fails closed when its secret cannot be decrypted.
 - **CSRF:** every mutation requires `x-csrf` matching the per-session token
   issued at auth (Strict cookies alone aren't relied on).
 - **Tenant isolation:** every query scoped by session `user_id`; isolation
@@ -35,17 +38,18 @@ injection, (b) a compromised model provider producing out-of-policy actions,
   coverage denials; `case_events` for every action/result/retry.
 - **Rate limiting:** login attempts + per-user request counters in D1 (basic;
   see gaps).
-- **Minimal secrets footprint:** only `SECRET_KEY` is a deploy secret; no
-  provider keys ship with the app.
+- **Minimal secrets footprint:** deploy secrets are binding-scoped (`SECRET_KEY`
+  for encrypted state and `TURNSTILE_SECRET` for signup verification); provider
+  keys are customer-owned encrypted connection data and never ship with the app.
 
 ## Known gaps (honest)
 
-- No 2FA on customer accounts (V1.1).
 - Rate limiting is counter-based in D1, not Cloudflare-native throttling.
-- `SECRET_KEY` rotation requires re-encrypting `config_enc` rows (script
-  planned).
-- Email inbound shared-secret auth until real routing lands.
-- Data export/deletion endpoints designed but not shipped (schema supports
-  cascade deletes; `/api/account/export|delete` V1.1).
-- RLS equivalent doesn't exist in D1 — isolation depends on app-layer
-  filtering (mitigated by tests).
+- `SECRET_KEY` rotation requires re-encrypting `config_enc` and TOTP rows
+  (script planned); unreadable enabled TOTP now blocks sign-in rather than
+  silently bypassing factor two.
+- Email Workers do not expose a stable trusted SPF/DKIM/DMARC verdict here.
+  Forward-to-start therefore requires a signed-in one-hour confirmation link;
+  its text payload is preserved, while attachments require a later upload.
+- Account export/delete is shipped, but D1 has no RLS equivalent — isolation
+  depends on app-layer filtering and tests.
