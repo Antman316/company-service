@@ -10,7 +10,15 @@ import { createApproval } from "./approvals";
 import { getCase, transitionCase, createCase } from "./caseEngine";
 import { addMs, json, newId, nowIso, q, q1, run } from "./db";
 import { caseEvent, auditEvent } from "./events";
-import { dueFollowUps, markFired, scheduleFollowUp, cancelFollowUps } from "./followups";
+import {
+  cancelFollowUps,
+  claimForRecovery,
+  dueFollowUps,
+  markFired,
+  recordEffect,
+  scheduleFollowUp,
+  strandedEffects,
+} from "./followups";
 import { getActiveMandate } from "./mandate";
 import { latestOutcome, recordOutcome } from "./outcomes";
 import { finalizeResults, receiptState, recordReceipt } from "./results";
@@ -18,6 +26,7 @@ import { describeAction, nextProposedAction, proposeAction } from "./actions";
 import { SpendCapError, bumpCaseSpendCap } from "./spend";
 import { contentCheck, recordFraudSignal } from "./abuse";
 import { notify, sendVerificationEmail, sendSystemEmail } from "./notify";
+import { reportError } from "./ops";
 import { classifyAction, classifyMerchantOffer } from "./policy";
 import {
   addDeadline,
@@ -692,6 +701,35 @@ export async function ingestMerchantMessage(
     });
   }
   await caseEvent(db, caseRow.id, "message_received", "merchant", { preview: body.slice(0, 200), duplicate: stored.duplicate === "content" });
+
+  // M6 honest labels: a merchant reply observed on this lane promotes the
+  // company's matching coverage row to VERIFIED. Promotion is only allowed
+  // from CONTACT_CONFIRMED/UNVERIFIED — SIMULATED (test-merchant) lanes can
+  // never become VERIFIED, since sim traffic is not real contact.
+  const conv = await q1<{ channel: string }>(
+    db,
+    `SELECT channel FROM external_conversations WHERE id = ?`,
+    conversationId,
+  );
+  if (conv && caseRow.company_id) {
+    const promoted = await run(
+      db,
+      `UPDATE company_coverage SET verification_status = 'VERIFIED', last_verified_at = ?
+        WHERE company_id = ? AND channel = ? AND verification_status IN ('CONTACT_CONFIRMED','UNVERIFIED')`,
+      nowIso(),
+      caseRow.company_id,
+      conv.channel,
+    );
+    if (promoted.meta?.changes) {
+      await auditEvent(db, {
+        type: "lane_verified",
+        severity: "info",
+        caseId: caseRow.id,
+        data: { companyId: caseRow.company_id, channel: conv.channel },
+      });
+    }
+  }
+
   await notify(env, caseRow.user_id, "merchant_replied", {
     caseId: caseRow.id,
     subject: `${caseRow.company_name ?? "The company"} replied`,
@@ -801,7 +839,7 @@ export async function ingestMerchantMessage(
     case "acknowledgment": {
       await recordOutcome(db, caseRow.id, "ACKNOWLEDGED", "Merchant acknowledged the case.", { actor: "merchant" });
       await transitionIfAble(db, caseRow.id, "WAITING_FOR_COMPANY", "merchant acknowledged");
-      await scheduleFollowUp(db, caseRow.id, "check_commitment", addMs(nowIso(), (parsed.promiseDays ?? 1) * 24 * 3600 * 1000));
+      await scheduleFollowUp(db, caseRow.id, "check_commitment", addMs(nowIso(), (parsed.promiseDays ?? 1) * 24 * 3600 * 1000), {}, env);
       break;
     }
     case "promise": {
@@ -820,6 +858,7 @@ export async function ingestMerchantMessage(
         "check_commitment",
         addMs(nowIso(), Math.max(days, 1) * 24 * 3600 * 1000),
         { expected: "resolution" },
+        env,
       );
       // The promised date is a tracked deadline, honestly labeled as the
       // merchant's own statement.
@@ -876,7 +915,7 @@ export async function ingestMerchantMessage(
         // AUTO_ALLOWED acceptance (e.g. full requested amount).
         await recordOutcome(db, caseRow.id, "APPROVED", `Merchant approved the requested outcome: ${describeOffer(offer)}`, { actor: "merchant" });
         await transitionIfAble(db, caseRow.id, "WAITING_FOR_COMPANY", "offer accepted — awaiting issuance");
-        await scheduleFollowUp(db, caseRow.id, "check_commitment", addMs(nowIso(), 5 * 24 * 3600 * 1000));
+        await scheduleFollowUp(db, caseRow.id, "check_commitment", addMs(nowIso(), 5 * 24 * 3600 * 1000), {}, env);
       }
       break;
     }
@@ -896,7 +935,7 @@ export async function ingestMerchantMessage(
     }
     default: {
       await transitionIfAble(db, caseRow.id, "WAITING_FOR_COMPANY", "reply received; no immediate action needed");
-      await scheduleFollowUp(db, caseRow.id, "check_commitment", addMs(nowIso(), 2 * 24 * 3600 * 1000));
+      await scheduleFollowUp(db, caseRow.id, "check_commitment", addMs(nowIso(), 2 * 24 * 3600 * 1000), {}, env);
     }
   }
 }
@@ -1013,39 +1052,123 @@ export async function runFollowUpSweep(env: Env): Promise<{ fired: number; deadl
   for (const f of due) {
     const caseRow = await getCase(env.DB, f.case_id);
     if (!caseRow || caseRow.paused || ["RESOLVED", "CANCELLED", "UNRESOLVED", "UNSUPPORTED"].includes(caseRow.status)) {
-      await markFired(env.DB, f.id);
+      // Guard claim — only the claim winner closes the ledger; a 'claimed'
+      // row left undismissed would look stranded to the recovery backstop.
+      if (await markFired(env.DB, f.id)) {
+        await recordEffect(env.DB, f.case_id, f.id, "dismissed", "case missing, paused or terminal — no follow-up sent");
+      }
       continue;
     }
     const mandate = await getActiveMandate(env.DB, f.case_id);
     if (!mandate) {
-      await markFired(env.DB, f.id);
+      if (await markFired(env.DB, f.id)) {
+        await recordEffect(env.DB, f.case_id, f.id, "dismissed", "no active mandate — no follow-up sent");
+      }
       continue;
     }
-    await markFired(env.DB, f.id);
+    // Atomic claim — the workflow path may have already fired this follow-up.
+    if (!(await markFired(env.DB, f.id))) continue;
     fired++;
-
-    // Money check-in: commitment due means the customer should hear about it.
-    if (f.kind === "check_commitment") {
-      await notify(env, caseRow.user_id, "money_checkin", {
-        caseId: f.case_id,
-        subject: "Did the money land?",
-        body: "The company's promised date is here. Open the app and confirm whether the money arrived — it takes ten seconds.",
-      }).catch(() => {});
+    try {
+      await runFollowUpFire(env, f.case_id, f.kind, f.id);
+    } catch (e) {
+      // Post-claim failure stays visible: 'unknown' is recoverable (the action
+      // key is idempotent), so the backstop below can reconcile it bounded.
+      await recordEffect(env.DB, f.case_id, f.id, "unknown", e instanceof Error ? e.message : String(e));
+      await reportError(env, e, { route: "cron/followup_sweep", kind: "followup_fire", caseId: f.case_id });
     }
+  }
+  await recoverStrandedEffects(env);
+  return { fired, deadlines };
+}
 
-    const outcome = await latestOutcome(env.DB, f.case_id);
-    if (outcome && ["RECEIVED", "VERIFIED_RESOLVED", "DENIED", "UNRESOLVED"].includes(outcome.status)) {
+// ---------------------------------------------------------------------------
+// WO-2 recovery backstop: rows claimed whose effect never reached a terminal
+// state (crash/throw between claim and completion) are re-driven once per
+// sweep after a grace window — the cutoff keeps live in-flight attempts from
+// being stolen. Bounded by RECOVERY_ATTEMPT_CAP: at the cap the effect is
+// dismissed for manual reconcile rather than reclaimed forever. Recovery
+// never replays an ambiguous external effect — the deterministic case_actions
+// idempotency key makes a re-run re-attach to the same action row, and the
+// unkeyed customer notify is suppressed on re-attempts.
+// ---------------------------------------------------------------------------
+const RECOVERY_GRACE_MS = 10 * 60 * 1000;
+const RECOVERY_ATTEMPT_CAP = 5;
+const TERMINAL_CASE_STATES = ["RESOLVED", "CANCELLED", "UNRESOLVED", "UNSUPPORTED"];
+
+async function recoverStrandedEffects(env: Env): Promise<void> {
+  const cutoff = addMs(nowIso(), -RECOVERY_GRACE_MS);
+  for (const s of await strandedEffects(env.DB, cutoff)) {
+    const row = await q1<{ attempt: number }>(
+      env.DB,
+      `SELECT attempt FROM follow_ups WHERE id = ?`,
+      s.id,
+    );
+    if ((row?.attempt ?? 0) >= RECOVERY_ATTEMPT_CAP) {
+      await recordEffect(env.DB, s.case_id, s.id, "dismissed", `recovery cap ${RECOVERY_ATTEMPT_CAP} reached — manual reconcile needed`);
       continue;
     }
-
-    await transitionIfAble(env.DB, f.case_id, "FOLLOW_UP_DUE", "follow-up due");
-    // Propose a follow-up send; the policy engine re-gates it.
-    const key = `${f.case_id}:followup:${f.id}`;
-    await proposeAction(env.DB, f.case_id, "send_followup", { followUpId: f.id }, key);
-    await transitionIfAble(env.DB, f.case_id, "IN_PROGRESS", "processing follow-up");
-    await advanceCase(env, f.case_id, `followup:${f.id}`);
+    if (!(await claimForRecovery(env.DB, s.id, cutoff))) continue;
+    const caseRow = await getCase(env.DB, s.case_id);
+    if (!caseRow || caseRow.paused || TERMINAL_CASE_STATES.includes(caseRow.status) || !(await getActiveMandate(env.DB, s.case_id))) {
+      await recordEffect(env.DB, s.case_id, s.id, "dismissed", "recovered lease — case no longer eligible");
+      continue;
+    }
+    try {
+      await runFollowUpFire(env, s.case_id, s.kind, s.id, { reattempt: true });
+    } catch (e) {
+      await recordEffect(env.DB, s.case_id, s.id, "unknown", e instanceof Error ? e.message : String(e));
+      await reportError(env, e, { route: "cron/followup_sweep", kind: "followup_recover", caseId: s.case_id });
+    }
   }
-  return { fired, deadlines };
+}
+
+// One follow-up fire, shared by the cron sweep and the CaseWorkflow path
+// (M9): the caller has already claimed the row via markFired (or a bounded
+// claimForRecovery re-lease). WO-2: when followUpId is known, the effect
+// ledger records attempted → accepted → reconciled/dismissed here; a throw
+// before reconciliation is journaled 'unknown' by the caller. `reattempt`
+// marks a recovery re-run — the deterministic action key still re-attaches,
+// but unkeyed customer-facing effects (the money check-in notify) are
+// suppressed so an ambiguous external effect is never blindly replayed.
+export async function runFollowUpFire(
+  env: Env,
+  caseId: string,
+  kind: string,
+  followUpId?: string,
+  opts: { reattempt?: boolean } = {},
+): Promise<void> {
+  const effect = (
+    state: "attempted" | "accepted" | "reconciled" | "dismissed",
+    note?: string,
+  ) => (followUpId ? recordEffect(env.DB, caseId, followUpId, state, note) : Promise.resolve());
+  await effect("attempted");
+
+  const caseRow = await getCase(env.DB, caseId);
+  // Money check-in: commitment due means the customer should hear about it.
+  if (kind === "check_commitment" && caseRow && !opts.reattempt) {
+    await notify(env, caseRow.user_id, "money_checkin", {
+      caseId,
+      subject: "Did the money land?",
+      body: "The company's promised date is here. Open the app and confirm whether the money arrived — it takes ten seconds.",
+    }).catch(() => {});
+  }
+
+  const outcome = await latestOutcome(env.DB, caseId);
+  if (outcome && ["RECEIVED", "VERIFIED_RESOLVED", "DENIED", "UNRESOLVED"].includes(outcome.status)) {
+    await effect("dismissed", "outcome already terminal — nothing to send");
+    return;
+  }
+
+  await transitionIfAble(env.DB, caseId, "FOLLOW_UP_DUE", "follow-up due");
+  // Propose a follow-up send; the policy engine re-gates it. The deterministic
+  // key is the idempotency anchor: a recovery re-run finds the same row.
+  const key = `${caseId}:followup:${followUpId ?? newId("fup")}`;
+  await proposeAction(env.DB, caseId, "send_followup", { followUpId }, key);
+  await effect("accepted", key);
+  await transitionIfAble(env.DB, caseId, "IN_PROGRESS", "processing follow-up");
+  await advanceCase(env, caseId, `followup:${followUpId ?? "wf"}`);
+  await effect("reconciled", key);
 }
 
 // ---------------------------------------------------------------------------
@@ -1093,7 +1216,7 @@ export async function handleApprovalDecision(env: Env, approvalId: string, paylo
       await transitionIfAble(db, row.case_id, "RESOLUTION_PROPOSED", "receipt confirmed — awaiting close or document verification");
     } else {
       await recordOutcome(db, row.case_id, "REQUESTED", "Customer: not received yet — continuing to follow up.", { actor: "customer" });
-      await scheduleFollowUp(db, row.case_id, "check_commitment", addMs(nowIso(), 24 * 3600 * 1000));
+      await scheduleFollowUp(db, row.case_id, "check_commitment", addMs(nowIso(), 24 * 3600 * 1000), {}, env);
       await transitionIfAble(db, row.case_id, "WAITING_FOR_COMPANY", "customer has not received resolution");
     }
     return;
@@ -1115,7 +1238,7 @@ export async function handleApprovalDecision(env: Env, approvalId: string, paylo
       if (u1) await notify(env, u1.user_id, "case_resolved", { caseId: row.case_id, subject: "Your case is resolved", body: "The case was closed as resolved. The full record is in the app." }).catch(() => {});
     } else {
       await recordOutcome(db, row.case_id, "REQUESTED", "Customer: continuing to pursue the remainder.", { actor: "customer" });
-      await scheduleFollowUp(db, row.case_id, "check_commitment", addMs(nowIso(), 24 * 3600 * 1000));
+      await scheduleFollowUp(db, row.case_id, "check_commitment", addMs(nowIso(), 24 * 3600 * 1000), {}, env);
       await transitionIfAble(db, row.case_id, "WAITING_FOR_COMPANY", "customer pursuing remainder after partial receipt");
     }
     return;
@@ -1137,7 +1260,7 @@ export async function handleApprovalDecision(env: Env, approvalId: string, paylo
       if (u2) await notify(env, u2.user_id, "case_resolved", { caseId: row.case_id, subject: "Your case is resolved", body: "The case was closed as resolved. The full record is in the app." }).catch(() => {});
     } else {
       await recordOutcome(db, row.case_id, "REQUESTED", "Customer: document-verified receipt does not fully resolve the case — continuing.", { actor: "customer" });
-      await scheduleFollowUp(db, row.case_id, "check_commitment", addMs(nowIso(), 24 * 3600 * 1000));
+      await scheduleFollowUp(db, row.case_id, "check_commitment", addMs(nowIso(), 24 * 3600 * 1000), {}, env);
       await transitionIfAble(db, row.case_id, "WAITING_FOR_COMPANY", "customer says receipt is incomplete");
     }
     return;
@@ -1211,7 +1334,7 @@ export async function handleApprovalDecision(env: Env, approvalId: string, paylo
         // Declining a draft isn't a resolution — the case just keeps waiting.
         await caseEvent(db, row.case_id, "draft_declined", "customer", { actionId: row.action_id, kind: act.kind });
         await transitionIfAble(db, row.case_id, "WAITING_FOR_COMPANY", "customer declined the draft — continuing with the merchant");
-        await scheduleFollowUp(db, row.case_id, "check_commitment", addMs(nowIso(), 2 * 24 * 3600 * 1000));
+        await scheduleFollowUp(db, row.case_id, "check_commitment", addMs(nowIso(), 2 * 24 * 3600 * 1000), {}, env);
       } else {
         await recordOutcome(db, row.case_id, "UNRESOLVED", "Customer declined the proposed action.", { actor: "customer" });
       }

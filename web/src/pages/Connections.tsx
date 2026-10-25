@@ -9,7 +9,7 @@ const PROVIDERS = [
   { id: "local_endpoint", label: "Local model endpoint (Ollama etc.)", fields: [{ k: "base_url", label: "Base URL (e.g. http://localhost:11434/v1)", secret: false }, { k: "model", label: "Model", secret: false }] },
 ];
 
-const AUTOMATION_TONE: Record<string, string> = { SIMULATED: "amber", AUTOMATED: "green", ASSISTED: "blue", MANUAL_HANDOFF: "blue", UNSUPPORTED: "red", TEMPORARILY_UNAVAILABLE: "amber" };
+const AUTOMATION_TONE: Record<string, string> = { SIMULATED: "amber", AUTOMATED: "green", ASSISTED: "blue", CONTACT_CONFIRMED: "blue", MANUAL_HANDOFF: "blue", UNSUPPORTED: "red", TEMPORARILY_UNAVAILABLE: "amber" };
 
 export function Connections() {
   const [conns, setConns] = useState<any[] | null>(null);
@@ -142,10 +142,11 @@ export function Connections() {
                 // never shown as "automated".
                 const honest = cv.verification_status !== "VERIFIED";
                 const label = honest ? cv.verification_status : cv.automation_level;
+                const degraded = cv.health === "degraded";
                 return (
                   <span key={cv.id}
-                    className={`chip chip-${honest ? AUTOMATION_TONE[cv.verification_status] ?? "amber" : "green"}`}
-                    title={`${cv.automation_level} · ${cv.verification_status}${cv.limitations ? " — " + cv.limitations : ""}`}>
+                    className={`chip chip-${degraded ? "amber" : honest ? AUTOMATION_TONE[cv.verification_status] ?? "amber" : "green"}`}
+                    title={`${cv.channel} · ${cv.automation_level} · ${cv.verification_status}${degraded ? " — lane degraded" : ""}${cv.limitations ? " — " + cv.limitations : ""}`}>
                     {cv.channel}: {label.replace(/_/g, " ")}
                   </span>
                 );

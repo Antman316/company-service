@@ -326,7 +326,7 @@ export async function handleCompanion(
     await run(db, `UPDATE case_actions SET status='executed', executed_at=? WHERE id=?`, nowIso(), act.id);
     await caseEvent(db, owned.id, "assisted_sent", "customer", { actionId: act.id, via: "companion" });
     await transitionCase(db, owned.id, "WAITING_FOR_COMPANY", { reason: "customer sent companion message", actor: "customer" });
-    await scheduleFollowUp(db, owned.id, "send_followup", addMs(nowIso(), 2 * 24 * 3600 * 1000), { via: "companion" });
+    await scheduleFollowUp(db, owned.id, "send_followup", addMs(nowIso(), 2 * 24 * 3600 * 1000), { via: "companion" }, env);
     return res({ ok: true });
   }
 
