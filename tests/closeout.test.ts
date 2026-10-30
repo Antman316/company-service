@@ -271,7 +271,7 @@ describe("evidence upload hardening", () => {
 });
 
 describe("cloudflare send_email transport", () => {
-  it("delivers through env.MAILOUT with stamped headers and no credential", async () => {
+  it("does not use an organization send key when the customer has no route", async () => {
     const sent: unknown[] = [];
     (env as any).MAILOUT = {
       send: async (m: unknown) => {
@@ -280,21 +280,20 @@ describe("cloudflare send_email transport", () => {
     };
     try {
       const { sendCaseEmail } = await import("../src/email/transport");
+      const { buildSendBinding, withDisclosedAssistance } = await import("../src/email/sendSafety");
+      const body = withDisclosedAssistance("Please confirm receipt.");
+      const to = "service@realmerchant.example";
+      const binding = await buildSendBinding({ body, recipient: to, mandateVersion: 1 });
       const r = await sendCaseEmail(env as any, "user_no_conns", {
-        to: "service@realmerchant.example",
+        to,
         subject: "Re: your case [CS-tok123]",
-        body: "Please confirm receipt.",
+        body,
         replyTo: "cases@agentmasterkey.com",
         messageId: "cs-tok123-act1@agentmasterkey.com",
-      });
-      expect(r.ok).toBe(true);
-      expect(r.transport).toBe("cloudflare_send_email");
-      expect(r.externalId).toBe("<cs-tok123-act1@agentmasterkey.com>");
-      expect(sent).toHaveLength(1);
-      // EmailMessage contents are opaque to the binding caller; delivery +
-      // threading headers are covered by the stamped externalId and the live
-      // cs-mail-out probe that rode the real MX path on prod.
-      expect(sent[0]).toBeTruthy();
+      }, { binding, mandateVersion: 1 });
+      expect(r.ok).toBe(false);
+      expect(r.transport).toBe("org_key_blocked");
+      expect(sent).toHaveLength(0);
     } finally {
       delete (env as any).MAILOUT;
     }

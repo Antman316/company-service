@@ -114,7 +114,10 @@ unverified-email account is refused a model call on prod.
   `connections.config_enc`; refresh-on-401; revoke wipes it (exists).
 - Outbound when connected: `From: customer@gmail.com`,
   `Reply-To: case+token@…`, `CC: case+token@…` so merchant replies-all land
-  in the case. Transport precedence already prefers Gmail.
+  in the case. Transport precedence already prefers Gmail. The body must
+  include the disclosed-assistance line, and the send must match a
+  single-use approval bound to that exact body, recipient, and mandate
+  version.
 - **Forwarding-filter step (R1):** ticketing systems often answer the `From`
   address and drop `Reply-To`/CC, so replies can stall in the customer's
   Gmail where we can't read them. At connect, walk the customer through
@@ -126,15 +129,14 @@ unverified-email account is refused a model call on prod.
   otherwise it stays `CONTACT_CONFIRMED` with a "no reply in N days → check
   your inbox / re-forward" prompt.
 - **Agent identity (R17):** Gmail-sent mail is in the customer's name, so
-  every outbound message carries an honest signature disclosure —
+  every outbound message carries an enforced disclosed-assistance line —
   "sent with the help of Company Service" — and never pretends to *be* the
   customer beyond what the customer reviewed and approved.
-- Fallback when not connected: `MAILOUT` from `case+token@` on the
-  **dedicated sending subdomain** (see 2.5) with a signed "on behalf of
-  <customer name>, account email <x>" line. Gmail is the **default** lane;
-  MAILOUT is the fallback, not the reverse (R5).
-- Google verification (sensitive scope) submitted before public launch;
-  launch is not blocked on it if the MAILOUT fallback is acceptable.
+- **No silent organization-key fallback.** If the customer has no connected
+  send route, the case send fails closed. `MAILOUT` and an organization
+  `RESEND_API_KEY` are not used as a fallback.
+- Google verification (sensitive scope) submitted before public launch.
+  Launch is not unblocked by falling back to an organization send key.
 - **Verify before reliance:** confirm Cloudflare `send_email` limits and
   acceptable-use terms for third-party recipients at volume (R5); a single
   successful send to `service@chewy.com` does not document the caps.
