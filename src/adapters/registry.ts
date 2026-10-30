@@ -13,16 +13,24 @@ import { testMerchantAdapter } from "./testMerchant";
 // verification status. "Amazon" is never globally "supported".
 // ---------------------------------------------------------------------------
 
-const ADAPTERS: Record<string, CompanyAdapter> = {
-  "test-merchant": testMerchantAdapter(),
-};
+const TEST_MERCHANT_ADAPTER_ID = "test-merchant";
 
-export function getAdapter(adapterId: string): CompanyAdapter | null {
-  return ADAPTERS[adapterId] ?? null;
+// The test-merchant adapter is a simulation. It is not registered when
+// ENVIRONMENT is production, even if a caller asks for it by id.
+function registeredAdapters(environment: string | undefined): Record<string, CompanyAdapter> {
+  const adapters: Record<string, CompanyAdapter> = {};
+  if (environment !== "production") {
+    adapters[TEST_MERCHANT_ADAPTER_ID] = testMerchantAdapter();
+  }
+  return adapters;
 }
 
-export function listAdapterIds(): string[] {
-  return Object.keys(ADAPTERS);
+export function getAdapter(adapterId: string, environment: string | undefined): CompanyAdapter | null {
+  return registeredAdapters(environment)[adapterId] ?? null;
+}
+
+export function listAdapterIds(environment: string | undefined): string[] {
+  return Object.keys(registeredAdapters(environment));
 }
 
 interface CoverageRow {

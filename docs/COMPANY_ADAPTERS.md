@@ -50,7 +50,9 @@ Deterministic simulated retailer for end-to-end verification:
 - Behaviors: refund promise with day-window, $60-store-credit partial offer
   (drives approval gating), evidence request, decline, delayed response,
   escalation ack, successful resolution.
-- Enabled when `SIM_MERCHANT_ENABLED` or non-production env.
+- Not registered when `ENVIRONMENT` is `production`. The production wrangler
+  config sets `SIM_MERCHANT_ENABLED` to `false`. Non-production environments
+  still register it for verification.
 
 **Why a simulation:** the mandate requires proving the engine without claiming
 real retailer coverage that hasn't been established. Everything the sim does
