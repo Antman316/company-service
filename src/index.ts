@@ -20,6 +20,7 @@ import { extractMessageIds, resolveInboundCase } from "./email/threading";
 import PostalMime from "postal-mime";
 import { encryptJson } from "./security/crypto";
 import { getSession, requireCsrf, signin, signout, signup } from "./http/auth";
+import { applyHtmlFrameHeaders, publicSurfaceResponse } from "./http/publicSurface";
 import { STATIC_FILES } from "./static";
 
 // --------------------------------------------------------------------------
@@ -650,8 +651,10 @@ async function deleteAccount(env: Env, uid: string, sessionToken: string) {
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     try {
-      await seedRegistry(env.DB);
       const url = new URL(req.url);
+      const surface = publicSurfaceResponse(url.pathname);
+      if (surface) return surface;
+      await seedRegistry(env.DB);
       if (url.pathname.startsWith("/api/")) {
         const session = await getSession(req, env.DB);
         return await api(req, { env, url, session });
@@ -659,19 +662,19 @@ export default {
       // SPA: prefer the ASSETS binding when present; otherwise serve the
       // inlined build (scripts/gen-static.mjs) — used when the assets upload
       // API isn't reachable from the deploy path.
-      if (env.ASSETS) return env.ASSETS.fetch(req);
+      if (env.ASSETS) return applyHtmlFrameHeaders(await env.ASSETS.fetch(req));
       const asset = STATIC_FILES[url.pathname];
       if (asset) {
         const bytes = Uint8Array.from(atob(asset.body), (ch) => ch.charCodeAt(0));
-        return new Response(bytes, {
+        return applyHtmlFrameHeaders(new Response(bytes, {
           headers: { "content-type": asset.type, "cache-control": url.pathname === "/index.html" ? "no-store" : "public, max-age=31536000, immutable" },
-        });
+        }));
       }
       const index = STATIC_FILES["/index.html"];
       if (index) {
-        return new Response(Uint8Array.from(atob(index.body), (ch) => ch.charCodeAt(0)), {
+        return applyHtmlFrameHeaders(new Response(Uint8Array.from(atob(index.body), (ch) => ch.charCodeAt(0)), {
           headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" },
-        });
+        }));
       }
       return new Response("Company Service", { status: 200 });
     } catch (e) {

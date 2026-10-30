@@ -36,6 +36,6 @@
     "EMAIL_DOMAIN": "agentmasterkey.com",
     "INBOUND_ADDRESS": "cases@agentmasterkey.com",
     "EMAIL_FROM": "Company Service <cases@agentmasterkey.com>",
-    "SIM_MERCHANT_ENABLED": "true"
+    "SIM_MERCHANT_ENABLED": "false"
   }
 }
