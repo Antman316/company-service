@@ -377,7 +377,10 @@ async function executeAction(
 ): Promise<{ continue: boolean; status?: string }> {
   const db = env.DB;
   const companyId = caseRow.company_id ?? "";
-  const adapter = getAdapter(companyId === "cmp_testmerchant" ? "test-merchant" : (await adapterFor(db, companyId)) ?? "");
+  const adapter = getAdapter(
+    companyId === "cmp_testmerchant" ? "test-merchant" : (await adapterFor(db, companyId)) ?? "",
+    env.ENVIRONMENT,
+  );
   const scenario = caseScenario(caseRow);
 
   if (action.kind === "send_message" || action.kind === "send_followup" || action.kind === "request_escalation") {
@@ -483,7 +486,7 @@ async function sendMerchantMessage(
 
   let resultData: Record<string, unknown> = {};
   if (adapterId) {
-    const adapter = getAdapter(adapterId)!;
+    const adapter = getAdapter(adapterId, env.ENVIRONMENT)!;
     const res = await adapter.execute(
       { kind: action.kind, payload: { ...json<Record<string, unknown>>(action.payload_json, {}), scenario, body } },
       ctx,
