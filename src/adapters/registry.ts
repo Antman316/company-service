@@ -248,4 +248,35 @@ export async function seedRegistry(db: D1Database): Promise<void> {
       "service@chewy.com",
     )
     .run();
+
+  // Test Merchant playbook (M3 escalation: rung-1 policy citation + rung-4
+  // executive contact both read from here). Guarded so a pre-0004 database
+  // keeps working until the migration is applied.
+  const hasPlaybooks = await q1<{ name: string }>(
+    db,
+    `SELECT name FROM sqlite_master WHERE type='table' AND name='merchant_playbooks'`,
+  );
+  if (hasPlaybooks) {
+    await db
+      .prepare(
+        `INSERT OR IGNORE INTO merchant_playbooks
+           (id, company_id, version, support_email, chat_url, executive_contact, return_window_days, policy_url, policy_quotes, known_deflections, what_works, last_verified_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+      )
+      .bind(
+        "pbk_testmerchant_v1",
+        testCo,
+        1,
+        "support@test-merchant.demo",
+        "chat://test-merchant.demo",
+        "executive@test-merchant.demo",
+        30,
+        "https://test-merchant.demo/policy/returns",
+        JSON.stringify(["Returns accepted within 30 days of delivery for a full refund to the original payment method."]),
+        JSON.stringify(["empathy without action", "policy wall without citation"]),
+        JSON.stringify(["cite the published returns policy", "ask for a supervisor with a deadline"]),
+        null,
+      )
+      .run();
+  }
 }

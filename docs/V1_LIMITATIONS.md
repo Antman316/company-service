@@ -59,6 +59,24 @@ elsewhere as built.
 
 ## Product
 
+- **Escalation engine IMPLEMENTED on `local_dev` (M3, sim-verified) — NOT
+  VERIFIED on prod.** Deflection detection (empathy-without-action,
+  policy-wall without citation, repeat non-answer, past-deadline promise)
+  drives a six-rung ladder: 1 restate+cite policy → 2 human/reference →
+  3 supervisor + 5-business-day deadline → 4 executive contact (playbook) →
+  5 card-dispute draft → 6 regulator-complaint drafts. Rungs 5–6 are
+  template-only from case records (merchant text is never an input), always
+  approval-gated, and the customer files the documents — the system never
+  files. No real-merchant escalation has run yet; Test Merchant `deflection`
+  + `stonewall` scenarios cover the climb in Vitest.
+- Evidence bundle PDFs are generated records (timeline + message log +
+  provenance-labeled claims + SHA-256 exhibit list), not legal documents.
+- Chargeback wording is deliberately honest: FCBA cited only for
+  credit-card goods-not-delivered cases; debit/unspecified → card-issuer
+  dispute under network rules. No Reg E claims for merchant disputes. The
+  letter is not legal advice and is labeled as such.
+- Case deadlines are source-labeled (CUSTOMER_STATED / MERCHANT_STATED /
+  COMPUTED); the chargeback window needs a customer-entered statement date.
 - No 2FA, no email verification, no password reset.
 - ~~Export/delete-account endpoints not shipped~~ — **done**:
   `/api/account/export` (13-table dump) + `/api/account/delete`

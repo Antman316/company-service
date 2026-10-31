@@ -38,6 +38,13 @@ const KNOWN_ACTION_KINDS = new Set([
   "request_escalation",
   "send_followup",
   "check_merchant_status",
+  // escalation ladder rungs (M3)
+  "escalate_policy_cite",     // rung 1 — restate + cite merchant policy
+  "escalate_request_human",   // rung 2 — human agent / reference number
+  "escalate_supervisor",      // rung 3 — supervisor + explicit deadline
+  "contact_executive",        // rung 4 — executive/corporate relations
+  "draft_chargeback",         // rung 5 — card-dispute draft (customer files)
+  "draft_complaint",          // rung 6 — regulator complaint drafts (customer files)
   // approval-gated
   "accept_partial_refund",
   "accept_store_credit",
@@ -60,6 +67,10 @@ const APPROVAL_BY_DEFAULT = new Set([
   "accept_new_terms",
   "close_case_satisfied",
 ]);
+
+// Drafts the customer files themselves. The system can never file them, so
+// they are always approval-gated regardless of what the mandate authorizes.
+const DRAFT_ONLY = new Set(["draft_chargeback", "draft_complaint"]);
 
 // Information categories an action might disclose; each must be granted.
 const DISCLOSURE_REQUIRED: Record<string, string> = {
@@ -115,6 +126,13 @@ export function classifyAction(action: ProposedAction, mandate: Mandate | null):
       : { policyClass: "PROHIBITED", reason: `mandate does not authorize ${kind}` };
   }
 
+  if (DRAFT_ONLY.has(kind)) {
+    return {
+      policyClass: "USER_APPROVAL_REQUIRED",
+      reason: `"${kind}" produces a document the customer reviews and files themselves — never sent or filed by the system`,
+    };
+  }
+
   if (APPROVAL_BY_DEFAULT.has(kind)) {
     return authorized.has(kind)
       ? { policyClass: "AUTO_ALLOWED", reason: `"${kind}" explicitly authorized` }
@@ -146,6 +164,13 @@ function kindToGrant(kind: string): string | null {
       return "request_escalation";
     case "send_followup":
       return "follow_up";
+    case "escalate_policy_cite":
+      return "request_refund";
+    case "escalate_request_human":
+    case "escalate_supervisor":
+      return "request_escalation";
+    case "contact_executive":
+      return "contact_executive";
     case "check_merchant_status":
       return "contact_company";
     default:

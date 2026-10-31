@@ -31,6 +31,23 @@ export function Approvals({ nav, onChanged }: { nav: (to: string) => void; onCha
           <div className="approval-card" key={a.id}>
             <div className="kind">{a.kind.replace(/_/g, " ")}</div>
             <div className="summary">{a.summary}</div>
+            {a.detail?.payload?.draft && (
+              <details style={{ margin: "8px 0" }}>
+                <summary className="small" style={{ cursor: "pointer" }}>View the draft — you review and file it yourself</summary>
+                <pre className="small" style={{ whiteSpace: "pre-wrap", maxHeight: 320, overflow: "auto", marginTop: 6 }}>{a.detail.payload.draft}</pre>
+              </details>
+            )}
+            {a.detail?.payload?.drafts && (
+              <details style={{ margin: "8px 0" }}>
+                <summary className="small" style={{ cursor: "pointer" }}>View the drafts — you review and file them yourself</summary>
+                {(a.detail.payload.drafts as any[]).map((d2: any) => (
+                  <div key={d2.agency} style={{ marginTop: 8 }}>
+                    <div className="small"><strong>{d2.agency}</strong> — {d2.url}</div>
+                    <pre className="small" style={{ whiteSpace: "pre-wrap", maxHeight: 240, overflow: "auto" }}>{d2.body}</pre>
+                  </div>
+                ))}
+              </details>
+            )}
             {a.caseId && (
               <div className="small muted" style={{ marginBottom: 10 }}>
                 <a href={`#/case/${a.caseId}`}>View case →</a>
