@@ -1,18 +1,34 @@
 import { q1 } from "../core/db";
 import { decryptJson } from "../security/crypto";
 import { TEST_MERCHANT_EMAIL } from "../adapters/testMerchant";
+import {
+  DISCLOSURE_REJECTION,
+  hasDisclosedAssistance,
+  orgKeySendDecision,
+  verifySendBinding,
+  type SendApprovalBinding,
+} from "./sendSafety";
 
 // ---------------------------------------------------------------------------
-// Outbound email transports — chosen in strict order:
+// Outbound case email — customer route only.
 //   1. test-merchant domain  -> internal simulation (DEMO, no mail leaves)
-//   2. active gmail connection (customer BYO OAuth, send-only gmail.send scope)
-//   3. Cloudflare send_email binding (env.MAILOUT) -> real delivery, no
-//      external credential — Email Routing's native outbound on the zone
-//   4. Resend send-only API key (env.RESEND_API_KEY / connection) -> real delivery
-//   5. dev_log (records intent, marks simulated — no real mail)
+//   2. disclosed-assistance line required, then per-send approval binding
+//   3. active gmail connection (customer BYO OAuth, send-only gmail.send scope)
+//   4. active resend connection (customer's own send-only key)
+//   5. organization keys (env.MAILOUT / env.RESEND_API_KEY) are NOT a fallback.
+//      If one is configured and the customer has no route, the send fails closed.
+//   6. dev_log only when no customer route and no organization key is configured
 // The customer's Gmail is only ever used to SEND — we never read their inbox.
 // Inbound replies land on env.INBOUND_ADDRESS via Cloudflare Email Routing.
+// System mail to the customer (verify/reset/notify) is a separate path.
 // ---------------------------------------------------------------------------
+
+export interface SendGate {
+  binding: SendApprovalBinding | null;
+  mandateVersion: number;
+  /** Claim the approval for this attempt. False means it was already used. */
+  consume?: () => Promise<boolean>;
+}
 
 export interface OutboundEmail {
   to: string;
@@ -40,6 +56,9 @@ interface GmailCfg {
 async function gmailSend(cfg: GmailCfg, msg: OutboundEmail): Promise<SendResult> {
   if (!cfg.accessToken || !cfg.from) {
     return { ok: false, transport: "gmail", error: "missing access token or from address" };
+  }
+  if (!hasDisclosedAssistance(msg.body)) {
+    return { ok: false, transport: "gmail", error: DISCLOSURE_REJECTION };
   }
   const mime = [
     `From: ${cfg.from}`,
@@ -78,6 +97,9 @@ async function resendSend(cfg: ResendCfg, msg: OutboundEmail): Promise<SendResul
   if (!cfg.apiKey || !cfg.from) {
     return { ok: false, transport: "resend", error: "missing api key or from address" };
   }
+  if (!hasDisclosedAssistance(msg.body)) {
+    return { ok: false, transport: "resend", error: DISCLOSURE_REJECTION };
+  }
   const headers: Record<string, string> = { ...(msg.headers ?? {}) };
   if (msg.messageId) headers["Message-ID"] = `<${msg.messageId}>`;
   try {
@@ -108,6 +130,9 @@ async function cloudflareSend(env: Env, msg: OutboundEmail): Promise<SendResult>
   if (!env.MAILOUT) {
     return { ok: false, transport: "cloudflare_send_email", error: "MAILOUT binding not configured" };
   }
+  if (!hasDisclosedAssistance(msg.body)) {
+    return { ok: false, transport: "cloudflare_send_email", error: DISCLOSURE_REJECTION };
+  }
   const fromAddr = env.INBOUND_ADDRESS ?? "cases@agentmasterkey.com";
   const raw = [
     `From: ${env.EMAIL_FROM ?? `Company Service <${fromAddr}>`}`,
@@ -133,15 +158,30 @@ async function cloudflareSend(env: Env, msg: OutboundEmail): Promise<SendResult>
   }
 }
 
-// Route an outbound case email through the right transport.
+// Route an outbound case email. Organization keys are never a silent fallback.
 export async function sendCaseEmail(
   env: Env,
   userId: string,
   msg: OutboundEmail,
+  gate?: SendGate,
 ): Promise<SendResult> {
   const domain = msg.to.split("@")[1]?.toLowerCase() ?? "";
   if (msg.to.toLowerCase() === TEST_MERCHANT_EMAIL || domain === "test-merchant.demo") {
     return { ok: true, transport: "sim_email", externalId: `sim-${Date.now()}`, simulated: true };
+  }
+
+  if (!hasDisclosedAssistance(msg.body)) {
+    return { ok: false, transport: "blocked", error: DISCLOSURE_REJECTION };
+  }
+
+  const verified = await verifySendBinding({
+    binding: gate?.binding,
+    body: msg.body,
+    recipient: msg.to,
+    mandateVersion: gate?.mandateVersion ?? Number.NaN,
+  });
+  if (!verified.ok) {
+    return { ok: false, transport: "blocked", error: verified.error };
   }
 
   const conn = await q1<{ config_enc: string | null }>(
@@ -149,32 +189,40 @@ export async function sendCaseEmail(
     `SELECT config_enc FROM connections WHERE user_id = ? AND type = 'email' AND provider = 'gmail' AND status = 'active' ORDER BY created_at DESC LIMIT 1`,
     userId,
   );
-  if (conn?.config_enc && env.SECRET_KEY) {
-    const cfg = await decryptJson<GmailCfg>(conn.config_enc, env.SECRET_KEY);
-    return gmailSend(cfg, msg);
-  }
-
-  if (env.MAILOUT) {
-    return cloudflareSend(env, msg);
-  }
-
   const resConn = await q1<{ config_enc: string | null }>(
     env.DB,
     `SELECT config_enc FROM connections WHERE user_id = ? AND type = 'email' AND provider = 'resend' AND status = 'active' ORDER BY created_at DESC LIMIT 1`,
     userId,
   );
+  const hasCustomerRoute = Boolean(
+    (conn?.config_enc && env.SECRET_KEY) || (resConn?.config_enc && env.SECRET_KEY),
+  );
+  const orgDecision = orgKeySendDecision({
+    hasCustomerRoute,
+    orgKeyAvailable: Boolean(env.MAILOUT || env.RESEND_API_KEY),
+  });
+  if (!orgDecision.ok) {
+    return { ok: false, transport: "org_key_blocked", error: orgDecision.error };
+  }
+
+  if (gate?.consume) {
+    const claimed = await gate.consume();
+    if (!claimed) {
+      return { ok: false, transport: "blocked", error: "send rejected: approval already used" };
+    }
+  }
+
+  if (conn?.config_enc && env.SECRET_KEY) {
+    const cfg = await decryptJson<GmailCfg>(conn.config_enc, env.SECRET_KEY);
+    return gmailSend(cfg, msg);
+  }
+
   if (resConn?.config_enc && env.SECRET_KEY) {
     const cfg = await decryptJson<ResendCfg>(resConn.config_enc, env.SECRET_KEY);
     return resendSend({ ...cfg, from: cfg.from ?? env.EMAIL_FROM }, msg);
   }
-  if (env.RESEND_API_KEY) {
-    return resendSend(
-      { apiKey: env.RESEND_API_KEY, from: env.EMAIL_FROM ?? `Company Service <${env.INBOUND_ADDRESS ?? "cases@agentmasterkey.com"}>` },
-      msg,
-    );
-  }
 
-  // Dev transport: no real email leaves the system. Honest labeling.
+  // No customer route and no organization key: record intent only. Honest labeling.
   console.log(`[dev-email] to=${msg.to} subject=${msg.subject}`);
   return { ok: true, transport: "dev_log", externalId: `dev-${Date.now()}`, simulated: true };
 }
@@ -193,12 +241,8 @@ export async function emailCapability(env: Env, userId: string) {
   return {
     outbound: conn
       ? `${conn.provider} via customer connection (send-only scope)`
-      : env.MAILOUT
-        ? `cloudflare send_email (${env.EMAIL_FROM ?? "cases@agentmasterkey.com"})`
-        : env.RESEND_API_KEY
-          ? `resend send-only key (${env.EMAIL_FROM ?? "cases@agentmasterkey.com"})`
-          : "dev_log (no live delivery)",
+      : "not configured — a customer send route is required; organization keys are not a fallback",
     inbound,
-    configured: !!conn || !!env.MAILOUT || !!env.RESEND_API_KEY,
+    configured: !!conn,
   };
 }

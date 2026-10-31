@@ -6,21 +6,21 @@ Minimum-permission email: send on the customer's behalf without reading their
 whole inbox. Two real lanes ship in V1:
 
 - **Inbound:** Cloudflare Email Routing → the worker's `email()` handler.
-- **Outbound:** Cloudflare `send_email` binding (`MAILOUT`) — Email
-  Routing's own managed SMTP path. No external credentials, no inbox
-  access, managed DKIM/SPF on the same zone. `gmail.send` on a
-  customer-OAuth'd connection takes precedence when connected; Resend
-  remains an optional fallback transport.
+- **Outbound:** customer Gmail (`gmail.send`) or the customer's own Resend
+  connection. Organization keys (`MAILOUT`, `RESEND_API_KEY`) are not a
+  silent case-send fallback — if no customer route is connected, the send
+  fails closed. System mail to the customer (verify, reset, notify) is a
+  separate path and still uses the service transport.
 
 ## Implemented
 
 | Piece | Status | Detail |
 |---|---|---|
-| `EmailTransport` interface | IMPLEMENTED | `send(msg)` → `{ok, messageId?}`; precedence: sim → gmail conn → `env.MAILOUT` (send_email) → resend conn → `env.RESEND_API_KEY` → dev_log |
-| `cloudflare_send_email` transport | VERIFIED on prod | `EmailMessage` from `cloudflare:email` → `MAILOUT.send` — real mail through Cloudflare's managed SMTP. Prod proof: case outbound row `msg_muunvhw9zl8s2cc8re` → `service@chewy.com`, `external_id` = stamped `cs-<token>-<action>@agentmasterkey.com` |
+| `EmailTransport` interface | IMPLEMENTED | `send(msg)` requires the disclosed-assistance line and a per-send approval binding (body hash, recipient, mandate version, one use). Precedence: sim → gates → gmail connection → customer resend connection → fail closed if an organization key is configured → dev_log only when no organization key exists |
+| `cloudflare_send_email` transport | NOT ON THE CASE-SEND PATH | Organization `MAILOUT` is not selected for merchant mail. A missing customer route fails closed. System mail to the customer is a separate path |
 | `sim` transport | VERIFIED | Test Merchant's inbound/outbound loop |
-| `resend` transport | IMPLEMENTED — NOT LIVE-VERIFIED | `POST api.resend.com/emails`; optional fallback when `RESEND_API_KEY`/connection is configured |
-| `gmail.send` transport | IMPLEMENTED — NOT LIVE-VERIFIED | `POST gmail/v1/users/me/messages/send`, `gmail.send`-scoped token on an `email` connection; wins over MAILOUT when connected (it's the customer's own mailbox) |
+| `resend` transport | IMPLEMENTED — NOT LIVE-VERIFIED | Customer Resend connection only. `env.RESEND_API_KEY` is not a case-send fallback |
+| `gmail.send` transport | IMPLEMENTED — NOT LIVE-VERIFIED | `POST gmail/v1/users/me/messages/send`, `gmail.send`-scoped token on an `email` connection. The Gmail lane rejects a body that omits the disclosed-assistance line |
 | `dev_log` transport | IMPLEMENTED | audit-only fallback (writes the would-be send to events) |
 | Email Routing inbound | VERIFIED on prod | Literal rule `cases@agentmasterkey.com` → worker `email()`; real MX-transit message ingested 2026-10-05 (external msg `msg_muuniaf50l9j29c0p2`, CF-rewritten Message-ID, `receivedVia=cloudflare_email_routing`) |
 | Case resolution | IMPLEMENTED | `resolveInboundCase`: `case+token@` to-address → `[CS-token]` subject tag → `In-Reply-To`/`References` `external_id` → conversation → case; unmatched → audit `inbound_rejected` + `setReject` |

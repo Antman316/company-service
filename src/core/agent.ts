@@ -1,6 +1,12 @@
 import { checkCoverage, findCompany, getAdapter } from "../adapters/registry";
-import { TEST_MERCHANT_EMAIL } from "../adapters/testMerchant";
-import { sendCaseEmail } from "../email/transport";
+import { sendCaseEmail, type SendGate } from "../email/transport";
+import {
+  buildSendBinding,
+  consumeSendBinding,
+  verifySendBinding,
+  withDisclosedAssistance,
+  type SendApprovalBinding,
+} from "../email/sendSafety";
 import { caseAddress, caseEmailToken, subjectTag } from "../email/threading";
 import { runModel } from "../providers/registry";
 import { extractJsonSafe } from "../providers/local";
@@ -400,6 +406,110 @@ function caseScenario(caseRow: CaseRow): string | null {
   return meta.scenario ?? null;
 }
 
+type BoundEmailSend =
+  | { hold: true }
+  | { hold: false; ok: false; error: string }
+  | {
+      hold: false;
+      ok: true;
+      binding: SendApprovalBinding;
+      mandateVersion: number;
+      consume: NonNullable<SendGate["consume"]>;
+    };
+
+// Freeze the exact body and recipient, then require a single-use approval
+// bound to that body hash, recipient, and the active mandate version.
+async function ensureBoundEmailSend(
+  env: Env,
+  caseRow: CaseRow,
+  action: { id: string; kind: string; payload_json: string | null },
+  disclosed: string,
+  recipient: string,
+): Promise<BoundEmailSend> {
+  const db = env.DB;
+  const mandate = await getActiveMandate(db, caseRow.id);
+  if (!mandate || mandate.status !== "active") {
+    return { hold: false, ok: false, error: "send rejected: no active mandate" };
+  }
+
+  const existing = await q1<{ id: string; status: string; detail_json: string | null }>(
+    db,
+    `SELECT id, status, detail_json FROM approval_requests WHERE action_id = ? AND kind = 'send_binding' ORDER BY created_at DESC LIMIT 1`,
+    action.id,
+  );
+
+  if (!existing) {
+    const binding = await buildSendBinding({
+      body: disclosed,
+      recipient,
+      mandateVersion: mandate.version,
+    });
+    const payload = json<Record<string, unknown>>(action.payload_json, {});
+    await run(
+      db,
+      `UPDATE case_actions SET payload_json = ?, status = 'awaiting_approval' WHERE id = ?`,
+      JSON.stringify({ ...payload, body: disclosed, to: recipient }),
+      action.id,
+    );
+    const approvalId = await createApproval(env, caseRow.id, {
+      actionId: action.id,
+      kind: "send_binding",
+      summary: `Approve sending this exact email to ${recipient}? One use, bound to mandate version ${mandate.version}.`,
+      detail: {
+        bodyHash: binding.bodyHash,
+        recipient: binding.recipient,
+        mandateVersion: binding.mandateVersion,
+        body: disclosed,
+        actionKind: action.kind,
+      },
+      options: [
+        { id: "approve", label: "Approve this exact send", kind: "approve" },
+        { id: "reject", label: "Do not send", kind: "reject" },
+      ],
+    });
+    await run(db, `UPDATE case_actions SET approval_id = ? WHERE id = ?`, approvalId, action.id);
+    await transitionIfAble(db, caseRow.id, "WAITING_FOR_CUSTOMER", "per-send approval pending");
+    return { hold: true };
+  }
+
+  if (existing.status === "pending") {
+    await transitionIfAble(db, caseRow.id, "WAITING_FOR_CUSTOMER", "per-send approval pending");
+    return { hold: true };
+  }
+  if (existing.status !== "approved") {
+    return { hold: false, ok: false, error: "send rejected: per-send approval was not approved" };
+  }
+
+  const detail = json<{
+    bodyHash?: string;
+    recipient?: string;
+    mandateVersion?: number;
+    consumedAt?: string;
+  }>(existing.detail_json, {});
+  const binding: SendApprovalBinding = {
+    bodyHash: detail.bodyHash ?? "",
+    recipient: detail.recipient ?? "",
+    mandateVersion: typeof detail.mandateVersion === "number" ? detail.mandateVersion : -1,
+    approvalId: existing.id,
+    used: Boolean(detail.consumedAt),
+  };
+  const check = await verifySendBinding({
+    binding,
+    body: disclosed,
+    recipient,
+    mandateVersion: mandate.version,
+  });
+  if (!check.ok) return { hold: false, ok: false, error: check.error };
+
+  return {
+    hold: false,
+    ok: true,
+    binding,
+    mandateVersion: mandate.version,
+    consume: () => consumeSendBinding(db, existing.id),
+  };
+}
+
 async function sendMerchantMessage(
   env: Env,
   caseRow: CaseRow,
@@ -506,8 +616,6 @@ async function sendMerchantMessage(
     }
   }
 
-  const { id: outboundMsgId } = await recordMessage(db, conv, "out", subject, body, "queued");
-
   const ctx: ExecutionContext = {
     caseId: caseRow.id,
     userId: caseRow.user_id,
@@ -519,6 +627,7 @@ async function sendMerchantMessage(
 
   let resultData: Record<string, unknown> = {};
   if (adapterId) {
+    const { id: outboundMsgId } = await recordMessage(db, conv, "out", subject, body, "queued");
     const adapter = getAdapter(adapterId)!;
     const res = await adapter.execute(
       { kind: action.kind, payload: { ...json<Record<string, unknown>>(action.payload_json, {}), scenario, body } },
@@ -527,29 +636,39 @@ async function sendMerchantMessage(
     resultData = res.data ?? {};
     if (!res.ok) {
       await run(db, `UPDATE case_actions SET status='failed', error=? WHERE id=?`, res.error ?? "adapter error", action.id);
+      await run(db, `UPDATE external_messages SET status='failed' WHERE id=?`, outboundMsgId);
       await caseEvent(db, caseRow.id, "action_failed", "system", { actionId: action.id, error: res.error });
       return { continue: true };
     }
   } else if (channel === "email") {
     const payloadTo = json<{ to?: string }>(action.payload_json, {}).to;
-    const to = payloadTo ?? (adapterId === "test-merchant" ? TEST_MERCHANT_EMAIL : (coverage.channelAddress ?? ""));
+    const to = payloadTo ?? coverage.channelAddress ?? "";
     if (!to) {
       await run(db, `UPDATE case_actions SET status='failed', error='no destination address registered for email channel' WHERE id=?`, action.id);
-      await run(db, `UPDATE external_messages SET status='failed' WHERE id=?`, outboundMsgId);
       return { continue: true };
     }
-    // Stamp our own RFC Message-ID so the merchant's In-Reply-To threads back
-    // even when they mangle the subject tag.
+    const disclosed = withDisclosedAssistance(body);
+    const gate = await ensureBoundEmailSend(env, caseRow, action, disclosed, to);
+    if (gate.hold) return { continue: false, status: "WAITING_FOR_CUSTOMER" };
+    if (!gate.ok) {
+      await run(db, `UPDATE case_actions SET status='failed', error=? WHERE id=?`, gate.error, action.id);
+      await caseEvent(db, caseRow.id, "send_binding_rejected", "policy", { actionId: action.id, error: gate.error });
+      return { continue: true };
+    }
+    const { id: outboundMsgId } = await recordMessage(db, conv, "out", subject, disclosed, "queued");
     const domain = env.EMAIL_DOMAIN ?? "agentmasterkey.com";
     const stampedId = `cs-${caseEmailToken(caseRow.id)}-${action.id.replace(/^act_/, "").slice(0, 10)}@${domain}`;
     const sent = await sendCaseEmail(env, caseRow.user_id, {
       to,
       subject,
-      body,
+      body: disclosed,
       replyTo: env.INBOUND_ADDRESS ?? caseAddress(caseRow.id, domain),
       messageId: stampedId,
+    }, {
+      binding: gate.binding,
+      mandateVersion: gate.mandateVersion,
+      consume: gate.consume,
     });
-    // Record the provider outcome + the stamped id on the outbound row.
     await run(
       db,
       `UPDATE external_messages SET status=?, external_id=?, meta_json=? WHERE id=?`,
@@ -563,6 +682,7 @@ async function sendMerchantMessage(
       return { continue: true };
     }
   } else {
+    const { id: outboundMsgId } = await recordMessage(db, conv, "out", subject, body, "queued");
     await run(db, `UPDATE external_messages SET status='sent' WHERE id=?`, outboundMsgId);
   }
 
@@ -1306,6 +1426,25 @@ export async function handleApprovalDecision(env: Env, approvalId: string, paylo
   if (row.kind === "email_verify_to_send" || row.kind === "email_verify_to_continue") {
     // Acknowledgement only — the case unpauses when the customer verifies
     // (verify-email flow clears it) or manually resumes.
+    return;
+  }
+
+  if (row.kind === "send_binding") {
+    if (row.status === "approved" && row.action_id) {
+      await run(db, `UPDATE case_actions SET status = 'proposed', error = NULL WHERE id = ?`, row.action_id);
+      await transitionIfAble(db, row.case_id, "IN_PROGRESS", "exact send approved");
+      await advanceCase(env, row.case_id, "approval:send-binding");
+    } else if (row.action_id) {
+      await run(
+        db,
+        `UPDATE case_actions SET status = 'rejected', error = 'customer rejected the exact send' WHERE id = ?`,
+        row.action_id,
+      );
+      await caseEvent(db, row.case_id, "send_binding_rejected", "customer", {
+        actionId: row.action_id,
+        approvalId: row.id,
+      });
+    }
     return;
   }
 
