@@ -46,7 +46,11 @@ backups/YYYY-MM-DD/manifest.json   — {generatedAt, environment, tables:{name:r
 ```
 
 to `env.EVIDENCE`. Days older than `BACKUP_RETENTION_DAYS` (default 30) are
-pruned in the same run. Completion is audited (`backup_run`).
+pruned in the same run — `pruneExpiredBackups` walks the full `backups/`
+prefix (paginated) and writes one `backup_pruned` audit event with counts.
+Completion is audited (`backup_run`).
+
+Deleted account data may persist in encrypted operational backups for up to 30 days, after which it is purged.
 
 ### Restore drill (performed from any machine with the CF API)
 

@@ -88,6 +88,52 @@ export async function backupDue(db: D1Database): Promise<boolean> {
   return new Date(last.created_at).getTime() < Date.now() - 23 * 3600 * 1000;
 }
 
+// Single resolver for the retention number so the scheduled purge, the
+// account_deleted audit record, and the Privacy-page disclosure can never
+// disagree on it.
+export function backupRetentionDays(env: Env): number {
+  return Number(env.BACKUP_RETENTION_DAYS ?? DEFAULT_RETENTION_DAYS) || DEFAULT_RETENTION_DAYS;
+}
+
+// Retention purge: delete every object under backups/<YYYY-MM-DD>/ whose UTC
+// day component is older than the cutoff — table JSONL and manifest alike.
+// Paginates the whole prefix (stale keys past the first 1000 must not
+// survive), chunks the R2 delete at the 1000-keys-per-call cap, records one
+// audit event with counts, and is idempotent — a second run deletes zero.
+export async function pruneExpiredBackups(
+  env: Env,
+): Promise<{ pruned: number; retentionDays: number; days: string[] }> {
+  const retentionDays = backupRetentionDays(env);
+  const cutoff = new Date(Date.now() - retentionDays * 24 * 3600 * 1000).toISOString().slice(0, 10);
+  const days = new Set<string>();
+  let pruned = 0;
+  let cursor: string | undefined;
+  do {
+    const listed = await env.EVIDENCE.list({ prefix: BACKUP_PREFIX, limit: 1000, cursor });
+    const stale: string[] = [];
+    for (const o of listed.objects ?? []) {
+      const day = o.key.slice(BACKUP_PREFIX.length, BACKUP_PREFIX.length + 10);
+      if (day < cutoff) {
+        stale.push(o.key);
+        days.add(day);
+      }
+    }
+    for (let i = 0; i < stale.length; i += 1000) {
+      const chunk = stale.slice(i, i + 1000);
+      await env.EVIDENCE.delete(chunk);
+      pruned += chunk.length;
+    }
+    cursor = listed.truncated ? listed.cursor : undefined;
+  } while (cursor);
+  const dayList = [...days].sort();
+  await auditEvent(env.DB, {
+    type: "backup_pruned",
+    severity: "info",
+    data: { pruned, retentionDays, days: dayList },
+  });
+  return { pruned, retentionDays, days: dayList };
+}
+
 export async function runDailyBackup(env: Env): Promise<{ date: string; tables: number; rows: number; pruned: number }> {
   const date = nowIso().slice(0, 10);
   const tables = await q<{ name: string }>(
@@ -115,21 +161,14 @@ export async function runDailyBackup(env: Env): Promise<{ date: string; tables: 
   );
 
   // Retention: drop backup days older than BACKUP_RETENTION_DAYS (default 30).
-  const retention = Number(env.BACKUP_RETENTION_DAYS ?? DEFAULT_RETENTION_DAYS) || DEFAULT_RETENTION_DAYS;
-  const cutoff = new Date(Date.now() - retention * 24 * 3600 * 1000).toISOString().slice(0, 10);
-  const listed = await env.EVIDENCE.list({ prefix: BACKUP_PREFIX, limit: 1000 });
-  const stale = (listed.objects ?? []).filter((o) => {
-    const day = o.key.slice(BACKUP_PREFIX.length, BACKUP_PREFIX.length + 10);
-    return day < cutoff;
-  });
-  if (stale.length) await env.EVIDENCE.delete(stale.map((o) => o.key));
+  const { pruned, retentionDays: retention } = await pruneExpiredBackups(env);
 
   await auditEvent(env.DB, {
     type: "backup_run",
     severity: "info",
-    data: { date, tables: tables.length, rows: total, pruned: stale.length, retentionDays: retention },
+    data: { date, tables: tables.length, rows: total, pruned, retentionDays: retention },
   });
-  return { date, tables: tables.length, rows: total, pruned: stale.length };
+  return { date, tables: tables.length, rows: total, pruned };
 }
 
 // ---- inbound queue ---------------------------------------------------------
