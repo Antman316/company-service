@@ -32,7 +32,7 @@ import {
 } from "./http/account";
 import { consumeUserToken, countRecentTokens, issueUserToken, sendVerificationEmail, sendSystemEmail } from "./core/notify";
 import { healthCheckDue, runDirectoryHealthCheck } from "./adapters/directory";
-import { backupDue, inboundRawKey, reportError, runDailyBackup } from "./core/ops";
+import { backupDue, backupRetentionDays, inboundRawKey, reportError, runDailyBackup } from "./core/ops";
 import type { InboundQueueMessage } from "./core/ops";
 export { CaseWorkflow } from "./core/caseWorkflow";
 import { activeCaseCount, MAX_ACTIVE_CASES_PER_USER, recordFraudSignal } from "./core/abuse";
@@ -1142,6 +1142,15 @@ async function deleteAccount(env: Env, uid: string, sessionToken: string) {
     `DELETE FROM users WHERE id = ?`,
   ].map((sql) => env.DB.prepare(sql).bind(uid));
   await env.DB.batch(stmts);
+  // Written AFTER the batch: a row with user_id = uid would be destroyed by
+  // the batch's own audit_events wipe above. user_id stays NULL and the uid
+  // rides in data_json. backup_retention_days binds the deletion disclosure
+  // (docs/OPS.md, #/privacy) to the resolver the scheduled purge enforces.
+  await auditEvent(env.DB, {
+    type: "account_deleted",
+    severity: "info",
+    data: { user_id: uid, backup_retention_days: backupRetentionDays(env) },
+  });
   void sessionToken;
 }
 

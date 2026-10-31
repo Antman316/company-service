@@ -76,6 +76,7 @@ export function Privacy() {
         <li>Delete everything: Settings → Delete account (irreversible).</li>
         <li>Notification preferences: per-kind opt-out in Settings.</li>
       </ul>
+      <p>Deleted account data may persist in encrypted operational backups for up to 30 days, after which it is purged.</p>
 
       <h2>Processors</h2>
       <p>Cloudflare (hosting, D1 database, R2 storage, Turnstile abuse checks) and Resend (system email delivery) process data as our subprocessors. AI model providers see case content only when you connect your own key or when platform models are enabled for verified accounts.</p>
