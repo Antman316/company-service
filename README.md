@@ -8,9 +8,8 @@ that went unanswered — and Company Service opens a durable case, collects
 evidence, asks for a bounded mandate, contacts the company through the best
 supported channel, follows up automatically, and reports an honest outcome.
 
-- **Live:** <https://company-service.agentmasterkey.com>
-- **Status:** V1 — vertical slice VERIFIED end-to-end (see
-  [docs/TESTING.md](docs/TESTING.md) and [docs/V1_LIMITATIONS.md](docs/V1_LIMITATIONS.md))
+- **Host named in [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md):** <https://company-service.agentmasterkey.com> — this README does not claim that host is serving this commit.
+- **Status:** V1 vertical slice is in this repository. This README does not claim end-to-end release verification (see [docs/V1_LIMITATIONS.md](docs/V1_LIMITATIONS.md)).
 - **Tracking:** [V1 epic](https://github.com/Antman316/company-service/issues/1)
 
 ## What it is not
@@ -31,7 +30,7 @@ customer's mandate, create approvals for themselves, or turn "promised" into
 | Durable follow-ups | Cron trigger every 5 min + `follow_ups` table |
 | Frontend | React 19 + TypeScript + Vite, served from the Worker |
 | Model layer | `ModelProvider` interface — `local_dev` (deterministic), `openai`, `anthropic`, `openai_compatible` |
-| Tests | vitest + `@cloudflare/vitest-pool-workers` (19 tests) |
+| Tests | vitest + `@cloudflare/vitest-pool-workers` (93 `it()` cases under `tests/`) |
 
 ## Run locally
 
@@ -60,7 +59,7 @@ therefore serves the SPA from an inlined build (see
 - [ARCHITECTURE](docs/ARCHITECTURE.md) — components and data flow
 - [AUTHORITY_MODEL](docs/AUTHORITY_MODEL.md) — mandates, grants, revocation
 - [CASE_STATE_MACHINE](docs/CASE_STATE_MACHINE.md) — states and transitions
-- [DATA_MODEL](docs/DATA_MODEL.md) — all 20 tables
+- [DATA_MODEL](docs/DATA_MODEL.md) — schema notes; table definitions are the `CREATE TABLE` statements in `migrations/` (the linked doc's "20 tables" sentence describes `migrations/0001_init.sql` only)
 - [PROVIDER_ARCHITECTURE](docs/PROVIDER_ARCHITECTURE.md) — model providers + routing
 - [COMPANY_ADAPTERS](docs/COMPANY_ADAPTERS.md) — adapters + coverage registry
 - [EMAIL_ARCHITECTURE](docs/EMAIL_ARCHITECTURE.md) — threading, transports, inbound
