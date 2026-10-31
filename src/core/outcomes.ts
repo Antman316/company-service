@@ -34,10 +34,10 @@ export async function recordOutcome(
 export async function latestOutcome(
   db: D1Database,
   caseId: string,
-): Promise<{ status: OutcomeStatus; detail: string; created_at: string } | null> {
-  return q1<{ status: OutcomeStatus; detail: string; created_at: string }>(
+): Promise<{ status: OutcomeStatus; detail: string; evidence_note: string | null; created_at: string } | null> {
+  return q1<{ status: OutcomeStatus; detail: string; evidence_note: string | null; created_at: string }>(
     db,
-    `SELECT status, detail, created_at FROM outcome_events WHERE case_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+    `SELECT status, detail, evidence_note, created_at FROM outcome_events WHERE case_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1`,
     caseId,
   );
 }

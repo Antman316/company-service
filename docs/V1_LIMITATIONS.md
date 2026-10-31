@@ -5,16 +5,32 @@ elsewhere as built.
 
 ## Merchant coverage
 
-- **First real merchant lane: Chewy + US + email** — `service@chewy.com`
-  (official published support email). VERIFIED for initiating contact:
-  real outbound mail sent through `cloudflare_send_email` (prod case
-  `case_muunvdukh1f5pmklq3`, 2026-10-05). Replies ingest through the
-  live Email Routing lane (inbound verified separately). Does NOT imply
-  account access, order data, or guaranteed outcomes — those stay
-  MANUAL. Everything else → `UNSUPPORTED` + manual handoff.
-- Test Merchant remains SIMULATED; Amazon/Walmart/Target **chat** is
-  ASSISTED (lane VERIFIED on prod; merchant contact itself not proven);
-  Amazon email/portal remains UNVERIFIED.
+- **25-merchant launch directory (M6) IMPLEMENTED** — every launch merchant
+  has a `companies` row, a MANUAL_HANDOFF floor lane, per-channel coverage
+  lanes, and a `merchant_playbooks` row. Per the channel audit
+  (`MERCHANT_CHANNEL_AUDIT.md`): 4 publish a support email (Chewy, Zappos,
+  Sephora, Shein), 5 publish a web form, 24 publish a chat lane. Every lane
+  address carries its official-source URL in `notes`.
+- **Lane labels are honest:** `CONTACT_CONFIRMED` = the channel is
+  confirmed on the merchant's official site but no real customer case has
+  used it yet. `VERIFIED` = a real merchant reply was observed through
+  that lane (promoted automatically from CONTACT_CONFIRMED/UNVERIFIED when
+  a reply lands — never downgraded). Today only **Chewy + email** is
+  VERIFIED (real outbound mail `service@chewy.com`, prod case
+  `case_muunvdukh1f5pmklq3`, 2026-10-05). Ship gate ≥15 VERIFIED lanes is
+  **NOT MET** — it requires real cases, not seeding.
+- **SIMULATED lanes (Test Merchant) can never become VERIFIED** — sim
+  traffic is not real contact; the promotion only upgrades
+  CONTACT_CONFIRMED/UNVERIFIED rows.
+- **Monthly lane-health check IMPLEMENTED, UNVERIFIED** — the 5-min sweep
+  runs `runDirectoryHealthCheck` at most once per 30 days: email lanes
+  degrade on `send_bounced`/`delivery_failed` audit rows in the last 30d;
+  chat/form lanes degrade when the official URL stops answering. Flips
+  write `lane_health_change` audits. UNVERIFIED: the first real monthly
+  run has not happened yet.
+- Playbook fields `executive_contact`, `policy_quotes`, `chat_selectors`
+  start empty/null per lane — nothing is fabricated; verified contacts
+  land in playbooks as real cases produce them.
 - No autonomous browser/chat automation — ASSISTED is the shipped lane
   (see BROWSER_ARCHITECTURE). No CAPTCHA bypass, no credential storage.
 
@@ -88,17 +104,94 @@ elsewhere as built.
   video) requires real customer accounts and is not yet met.
 - Companion endpoints are rate-limited per pairing (120/min, 4000/day, counted
   from the audit trail) and every call writes an audit event.
-- No 2FA, no email verification, no password reset.
+- **Results & receipt tiers (M4) IMPLEMENTED.** `RECEIVED` splits by evidence
+  source: `customer_confirmed` vs `document_verified` (outcome `evidence_note`
+  carries it). `VERIFIED_RESOLVED` requires BOTH a document on file and the
+  customer confirming resolution — self-report alone tops out at RECEIVED.
+  A customer can still close a case on their word alone; it stays at the
+  RECEIVED tier and is labeled as such everywhere. Partial receipts record
+  partial amounts; a document that verifies already-confirmed money never
+  double-counts (`amount_recovered` = max attested, additions are increments).
+- `GET /api/results` is public but aggregate-only — merchants with fewer than
+  3 cases merge into "other" so no single case is inferable; totals include
+  SIMULATED cases (the caveat on the page says so). Owner-only per-case detail:
+  `GET /api/admin/results` gated by the `ADMIN_EMAILS` binding.
+- Document verification means "a document was stored on the case" — the amount
+  is parsed from the document text when possible, else customer-entered; the
+  parsed figure is not itself verified against a bank feed (no Plaid in V1).
+- ~~No 2FA, no email verification, no password reset~~ — **done (M7)**:
+  email verification (required before any real-channel outbound send), password
+  reset via an atomically claimed one-time mailed link, and optional TOTP 2FA
+  are implemented. TOTP fails closed if its encrypted secret cannot be read.
+  System mail goes through MAILOUT→Resend→dev_log — it never uses a customer's
+  case connection. Unverified accounts can still create cases and use the
+  deterministic local intake; real sends + non-local model calls are gated.
+- Spend caps (§11) IMPLEMENTED: per-case soft cap ($0.50 default → pause +
+  approval to continue), per-user daily ($5), global daily ($100) — all in
+  micro-USD env vars. They gate non-local model calls only; on `local_dev`
+  spend is $0 and the gate is dormant (verified via a fake BYO connection
+  in tests). Turnstile on signup is enforced only when `TURNSTILE_SECRET`
+  is configured on the worker — provisioned 2026-10-06 on both envs.
+- Abuse controls IMPLEMENTED: max 10 active cases/user (429), outbound
+  content checks (threats, PAN-like digit runs, credential patterns →
+  blocked + `fraud_signals` row), public `/api/abuse/report` inbox
+  (rate-limited per reporter). Email verification is **not** an anti-fraud
+  guarantee — it proves mailbox access, not identity.
+- Legal surfaces IMPLEMENTED but NOT LAWYER-REVIEWED: Terms, Privacy,
+  "How it works / what we never do", and "Not legal advice" pages are live
+  at public hash routes, with a consent checkbox at signup
+  (`tos_accepted_at`). The ship gate still requires a lawyer's pass on
+  template + terms wording.
+- Forward-to-start is **confirmation-gated**: a matching `From` header never
+  creates a case by itself because Email Workers do not expose a stable trusted
+  SPF/DKIM/DMARC verdict here. A verified account receives a one-hour link; no
+  case opens until that same account signs in and confirms. Unknown senders are
+  rejected, confirmations are rate-limited, and tokens are atomically one-shot.
+  The confirmation payload carries subject/body only; forwarded attachments
+  must be uploaded after the case opens.
 - ~~Export/delete-account endpoints not shipped~~ — **done**:
   `/api/account/export` (13-table dump) + `/api/account/delete`
   (R2 + full cascade incl. sessions), connection revoke wipes credentials,
   mandate revoke + pause/cancel — all verified on prod.
-- Onboarding is signup → straight to dashboard; no guided first-case tour.
+- ~~Onboarding is signup → straight to dashboard; no guided first-case tour~~
+  — **done (M7)**: empty dashboard now offers both entries (forward an email
+  to `case+new@…` or describe the problem), plus an email-verification
+  banner until verified.
 - Economics view is real but shows $0 local_dev costs until a paid provider
   is connected.
 
 ## Security
 
-- Rate limiting is basic D1 counters.
-- Error responses don't leak internals, but observability is `console.error`
-  + `audit_events` — no Sentry/Logpush wired yet (`logpush: false`).
+- Rate limiting is layered: in-worker D1 counters (companion 120/min +
+  4000/day per case, abuse-report 5/reporter/24h, 10 active cases/user)
+  plus ONE zone rate-limit rule live on prod: `/api/auth/*` blocked at
+  4 req/10s/IP (rule `571b1ce34e01453e959863048616499c`). The Free zone
+  plan caps this phase at 1 rule / period=10s / wildcard / timeout=10s —
+  `/api/companion/*` could not take the second rule and relies on the
+  in-worker counters alone.
+- Error responses don't leak internals. Observability (M9): every handler
+  catch (`fetch`, `scheduled`, `email`, queue consumer, workflow arm/fire)
+  calls `reportError` → `unhandled_error` audit + one alert email per
+  error-signature/hour to `OPS_ALERT_EMAIL` (default
+  admin@agentmasterkey.com) via MAILOUT. Sentry remains NOT IMPLEMENTED —
+  needs an account + DSN.
+
+## Ops & reliability (M9)
+
+- Inbound email bursts are buffered through the `cs-inbound` queue: the
+  raw MIME lands in R2 (`inbound-raw/`) and the `queue()` consumer runs
+  the full ingest pipeline with retries (3). Cheap checks (domain, dedup,
+  case resolution) stay synchronous so unknown mail still bounces. Without
+  the queue binding the handler falls back to synchronous ingest — same
+  pipeline, no behavior change.
+- Long-running follow-ups run as Cloudflare Workflows instances
+  (`CASE_WORKFLOW` → `CaseWorkflow`, one per follow-up, sleeps until
+  `due_at`). The 5-minute cron sweep stays as backstop; `markFired` is an
+  atomic pending→fired claim so whichever path fires first wins. Without
+  the binding (local dev, tests) only the cron path exists — same rows.
+- Daily D1 backup to R2 (`backups/<date>/*.jsonl` + `manifest.json`,
+  30-day retention) runs inside the cron sweep; restore drill is
+  documented in `docs/OPS.md`. IMPLEMENTED, drill pending on staging.
+- Mission Control status row exists (unchanged).
+- `logpush` still not wired; Workers Assets SPA move remains a
+  nice-to-have pending a credential with assets-upload rights.

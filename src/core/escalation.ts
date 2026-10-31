@@ -6,6 +6,7 @@ import { gatherCaseFacts, renderBundleLines, renderChargebackDraft, renderCompla
 import { buildPdf } from "./pdf";
 import { addEvidence } from "./evidence";
 import { recordOutcome } from "./outcomes";
+import { notify } from "./notify";
 import type { CaseRow } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -536,12 +537,22 @@ export async function runDeadlineSweep(env: Env): Promise<{ warned: number; miss
       await caseEvent(env.DB, d.case_id, "deadline_approaching", "system", {
         deadlineId: d.id, kind: d.kind, dueAt: d.due_at, source: d.source, window: "2d",
       });
+      await notify(env, caseRow.user_id, "deadline_approaching", {
+        caseId: d.case_id,
+        subject: `Deadline in ~2 days — ${d.kind.replace(/_/g, " ")}`,
+        body: `A deadline on your case lands around ${d.due_at.slice(0, 10)}. Open the app to see what's riding on it.`,
+      }).catch(() => {});
       warned++;
     } else if (!d.notified_7d) {
       await run(env.DB, `UPDATE case_deadlines SET notified_7d = 1 WHERE id = ?`, d.id);
       await caseEvent(env.DB, d.case_id, "deadline_approaching", "system", {
         deadlineId: d.id, kind: d.kind, dueAt: d.due_at, source: d.source, window: "7d",
       });
+      await notify(env, caseRow.user_id, "deadline_approaching", {
+        caseId: d.case_id,
+        subject: `Deadline in ~7 days — ${d.kind.replace(/_/g, " ")}`,
+        body: `A deadline on your case lands around ${d.due_at.slice(0, 10)}. Open the app to see what's riding on it.`,
+      }).catch(() => {});
       warned++;
     }
   }

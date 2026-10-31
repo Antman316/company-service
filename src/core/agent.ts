@@ -10,10 +10,23 @@ import { createApproval } from "./approvals";
 import { getCase, transitionCase, createCase } from "./caseEngine";
 import { addMs, json, newId, nowIso, q, q1, run } from "./db";
 import { caseEvent, auditEvent } from "./events";
-import { dueFollowUps, markFired, scheduleFollowUp, cancelFollowUps } from "./followups";
+import {
+  cancelFollowUps,
+  claimForRecovery,
+  dueFollowUps,
+  markFired,
+  recordEffect,
+  scheduleFollowUp,
+  strandedEffects,
+} from "./followups";
 import { getActiveMandate } from "./mandate";
 import { latestOutcome, recordOutcome } from "./outcomes";
+import { finalizeResults, receiptState, recordReceipt } from "./results";
 import { describeAction, nextProposedAction, proposeAction } from "./actions";
+import { SpendCapError, bumpCaseSpendCap } from "./spend";
+import { contentCheck, recordFraudSignal } from "./abuse";
+import { notify, sendVerificationEmail, sendSystemEmail } from "./notify";
+import { reportError } from "./ops";
 import { classifyAction, classifyMerchantOffer } from "./policy";
 import {
   addDeadline,
@@ -273,7 +286,7 @@ export async function advanceCase(
       await run(db, `UPDATE case_actions SET status = 'awaiting_approval' WHERE id = ?`, action.id);
       await syncEscalationStatus(db, action.id);
       const isDraft = action.kind.startsWith("draft_");
-      const approvalId = await createApproval(db, caseId, {
+      const approvalId = await createApproval(env, caseId, {
         actionId: action.id,
         kind: "action_approval",
         summary: isDraft
@@ -317,13 +330,14 @@ async function ensurePlan(env: Env, caseRow: CaseRow, mandate: unknown): Promise
   );
   if (existing) return;
 
-  const resp = await runModel(env, { userId: caseRow.user_id, caseId: caseRow.id }, {
+  const resp = await modelOrCap(env, { userId: caseRow.user_id, caseId: caseRow.id }, {
     role: "reasoning",
     system: SYSTEM_POLICY_PREAMBLE,
     userContext:
       `TASK:plan\nCOMPANY=${caseRow.company_name ?? "unknown"}\nISSUE=${caseRow.issue_type ?? ""}\nOBJECTIVE=${caseRow.desired_outcome ?? ""}\nMANDATE=${JSON.stringify(mandate)}`,
     responseFormat: "json",
-  });
+  }, caseRow);
+  if (!resp) return;
   const parsed = extractJsonSafe(resp.text) as { steps?: { kind: string; reason?: string }[] } | null;
 
   const planId = newId("plan");
@@ -405,15 +419,34 @@ async function sendMerchantMessage(
   if (explicitBody) {
     body = explicitBody;
   } else {
-    const compose = await runModel(env, { userId: caseRow.user_id, caseId: caseRow.id }, {
+    const compose = await modelOrCap(env, { userId: caseRow.user_id, caseId: caseRow.id }, {
       role: "light",
       system: SYSTEM_POLICY_PREAMBLE,
       userContext:
         `TASK:compose\nPURPOSE=${action.kind === "send_followup" ? "followup" : action.kind === "request_escalation" ? "escalation" : "initial"}\nCOMPANY=${companyName}\nOBJECTIVE=${caseRow.desired_outcome ?? ""}\nORDER_REF=${json<{ orderRef?: string }>(caseRow.meta, {}).orderRef ?? ""}\nTRACKING=${json<{ trackingRef?: string }>(caseRow.meta, {}).trackingRef ?? ""}\nCUSTOMER=the customer`,
       responseFormat: "json",
-    });
+    }, caseRow);
+    if (!compose) return { continue: false, status: (await getCase(db, caseRow.id))?.status };
     const composed = extractJsonSafe(compose.text) as { body?: string } | null;
     body = composed?.body ?? `Hello ${companyName}, regarding this order issue: ${caseRow.desired_outcome ?? "please review"}.`;
+  }
+
+  // §11 content check — applies to EVERYTHING the agent would put in front of
+  // a merchant, drafted or sent. Blocked sends fail the action, log a fraud
+  // signal, and stay on the timeline.
+  const check = contentCheck(body);
+  if (!check.ok) {
+    await recordFraudSignal(db, {
+      userId: caseRow.user_id, caseId: caseRow.id,
+      kind: "outbound_content_blocked",
+      detail: check.flags.map((f) => f.code).join(","),
+    });
+    await run(db, `UPDATE case_actions SET status='failed', error=? WHERE id=?`,
+      `content check blocked: ${check.flags.map((f) => f.code).join(", ")}`, action.id);
+    await caseEvent(db, caseRow.id, "outbound_blocked", "policy", {
+      actionId: action.id, flags: check.flags.map((f) => f.code),
+    });
+    return { continue: true };
   }
 
   const conv = await ensureConversation(db, caseRow.id, channel, adapterId ?? "none");
@@ -447,6 +480,30 @@ async function sendMerchantMessage(
       actor: "agent",
     });
     return { continue: false, status: "WAITING_FOR_CUSTOMER" };
+  }
+
+  // §11/M7: real outbound sends require a verified account email. Sim sends
+  // (test-merchant adapter, assisted drafts — which never send at all) are
+  // exempt: an unverified user can run deterministic/sim flows only.
+  const isRealSend = adapterId !== "test-merchant";
+  if (isRealSend) {
+    const u = await q1<{ email_verified_at: string | null; email: string }>(
+      db, `SELECT email_verified_at, email FROM users WHERE id = ?`, caseRow.user_id,
+    );
+    if (!u?.email_verified_at) {
+      await sendVerificationEmail(env, caseRow.user_id, u?.email ?? "").catch(() => {});
+      await run(db, `UPDATE case_actions SET status='skipped', error='email not verified' WHERE id=?`, action.id);
+      await caseEvent(db, caseRow.id, "send_blocked_email_unverified", "policy", {
+        actionId: action.id, channel, adapterId: adapterId ?? null,
+      });
+      await createApproval(env, caseRow.id, {
+        kind: "email_verify_to_send",
+        summary: "Verify your email address so the case can send real messages — a new verification link was just sent.",
+        detail: { actionId: action.id },
+        options: [{ id: "acknowledged", label: "I'll verify it", kind: "approve" }],
+      });
+      return { continue: true };
+    }
   }
 
   const { id: outboundMsgId } = await recordMessage(db, conv, "out", subject, body, "queued");
@@ -587,9 +644,11 @@ export async function recordMessage(
   const existing = await q1<{ id: string }>(db, `SELECT id FROM external_messages WHERE dedup_hash = ?`, dedup);
   if (existing) return { id: existing.id, duplicate: "content" };
   const id = newId("msg");
+  // OR IGNORE + re-read: same replica-lag race as proposeAction — a duplicate
+  // arriving between the check and the insert must be dedup'd, not 500'd.
   await run(
     db,
-    `INSERT INTO external_messages (id, conversation_id, direction, subject, body, meta_json, status, dedup_hash, external_id)
+    `INSERT OR IGNORE INTO external_messages (id, conversation_id, direction, subject, body, meta_json, status, dedup_hash, external_id)
      VALUES (?,?,?,?,?,?,?,?,?)`,
     id,
     conversationId,
@@ -601,7 +660,8 @@ export async function recordMessage(
     dedup,
     externalId ?? null,
   );
-  return { id, duplicate: null };
+  const row = await q1<{ id: string }>(db, `SELECT id FROM external_messages WHERE dedup_hash = ?`, dedup);
+  return { id: row?.id ?? id, duplicate: row && row.id !== id ? "content" : null };
 }
 
 // ---------------------------------------------------------------------------
@@ -642,13 +702,48 @@ export async function ingestMerchantMessage(
   }
   await caseEvent(db, caseRow.id, "message_received", "merchant", { preview: body.slice(0, 200), duplicate: stored.duplicate === "content" });
 
-  const analysis = await runModel(env, { userId: caseRow.user_id, caseId: caseRow.id }, {
+  // M6 honest labels: a merchant reply observed on this lane promotes the
+  // company's matching coverage row to VERIFIED. Promotion is only allowed
+  // from CONTACT_CONFIRMED/UNVERIFIED — SIMULATED (test-merchant) lanes can
+  // never become VERIFIED, since sim traffic is not real contact.
+  const conv = await q1<{ channel: string }>(
+    db,
+    `SELECT channel FROM external_conversations WHERE id = ?`,
+    conversationId,
+  );
+  if (conv && caseRow.company_id) {
+    const promoted = await run(
+      db,
+      `UPDATE company_coverage SET verification_status = 'VERIFIED', last_verified_at = ?
+        WHERE company_id = ? AND channel = ? AND verification_status IN ('CONTACT_CONFIRMED','UNVERIFIED')`,
+      nowIso(),
+      caseRow.company_id,
+      conv.channel,
+    );
+    if (promoted.meta?.changes) {
+      await auditEvent(db, {
+        type: "lane_verified",
+        severity: "info",
+        caseId: caseRow.id,
+        data: { companyId: caseRow.company_id, channel: conv.channel },
+      });
+    }
+  }
+
+  await notify(env, caseRow.user_id, "merchant_replied", {
+    caseId: caseRow.id,
+    subject: `${caseRow.company_name ?? "The company"} replied`,
+    body: `The company replied on your case. Open the app to see what they said and what happens next.`,
+  }).catch(() => {});
+
+  const analysis = await modelOrCap(env, { userId: caseRow.user_id, caseId: caseRow.id }, {
     role: "light",
     system: SYSTEM_POLICY_PREAMBLE,
     userContext: `TASK:analyze_merchant\nCASE_OBJECTIVE=${caseRow.desired_outcome ?? ""}\nREQUESTED_CENTS=${caseRow.amount_cents ?? ""}`,
     untrustedContent: wrapUntrusted(body, "merchant"),
     responseFormat: "json",
-  });
+  }, caseRow);
+  if (!analysis) return;
   const parsed = (extractJsonSafe(analysis.text) ?? {}) as {
     intent?: string;
     amountCents?: number | null;
@@ -744,7 +839,7 @@ export async function ingestMerchantMessage(
     case "acknowledgment": {
       await recordOutcome(db, caseRow.id, "ACKNOWLEDGED", "Merchant acknowledged the case.", { actor: "merchant" });
       await transitionIfAble(db, caseRow.id, "WAITING_FOR_COMPANY", "merchant acknowledged");
-      await scheduleFollowUp(db, caseRow.id, "check_commitment", addMs(nowIso(), (parsed.promiseDays ?? 1) * 24 * 3600 * 1000));
+      await scheduleFollowUp(db, caseRow.id, "check_commitment", addMs(nowIso(), (parsed.promiseDays ?? 1) * 24 * 3600 * 1000), {}, env);
       break;
     }
     case "promise": {
@@ -763,6 +858,7 @@ export async function ingestMerchantMessage(
         "check_commitment",
         addMs(nowIso(), Math.max(days, 1) * 24 * 3600 * 1000),
         { expected: "resolution" },
+        env,
       );
       // The promised date is a tracked deadline, honestly labeled as the
       // merchant's own statement.
@@ -784,12 +880,13 @@ export async function ingestMerchantMessage(
         { actor: "merchant" },
       );
       await transitionIfAble(db, caseRow.id, "RESOLUTION_PROPOSED", "merchant claims resolution issued");
-      await createApproval(db, caseRow.id, {
+      await createApproval(env, caseRow.id, {
         kind: "confirm_receipt",
         summary: `${caseRow.company_name ?? "The merchant"} says the refund/resolution was issued${parsed.amountCents ? ` ($${(parsed.amountCents / 100).toFixed(2)})` : ""}. Have you received it?`,
         detail: { merchantClaim: body.slice(0, 400) },
         options: [
-          { id: "received", label: "Yes — received, close the case", kind: "approve" },
+          { id: "received", label: "Yes — received in full", kind: "approve" },
+          { id: "partial", label: "Partially — some arrived, more expected", kind: "approve" },
           { id: "not_received", label: "Not yet — keep following up", kind: "reject" },
         ],
       });
@@ -804,7 +901,7 @@ export async function ingestMerchantMessage(
       };
       const decision = classifyMerchantOffer(offer, mandate);
       if (decision.policyClass === "USER_APPROVAL_REQUIRED" || decision.policyClass === "PROHIBITED") {
-        await createApproval(db, caseRow.id, {
+        await createApproval(env, caseRow.id, {
           kind: "merchant_offer",
           summary: `${caseRow.company_name ?? "Merchant"} offered: ${describeOffer(offer)} — you asked for ${fmtMoney(caseRow.amount_cents)}. ${decision.reason}`,
           detail: { offer, merchantText: body.slice(0, 400) },
@@ -818,14 +915,14 @@ export async function ingestMerchantMessage(
         // AUTO_ALLOWED acceptance (e.g. full requested amount).
         await recordOutcome(db, caseRow.id, "APPROVED", `Merchant approved the requested outcome: ${describeOffer(offer)}`, { actor: "merchant" });
         await transitionIfAble(db, caseRow.id, "WAITING_FOR_COMPANY", "offer accepted — awaiting issuance");
-        await scheduleFollowUp(db, caseRow.id, "check_commitment", addMs(nowIso(), 5 * 24 * 3600 * 1000));
+        await scheduleFollowUp(db, caseRow.id, "check_commitment", addMs(nowIso(), 5 * 24 * 3600 * 1000), {}, env);
       }
       break;
     }
 
     case "evidence_request": {
       await transitionIfAble(db, caseRow.id, "WAITING_FOR_CUSTOMER", "merchant requested additional evidence");
-      await createApproval(db, caseRow.id, {
+      await createApproval(env, caseRow.id, {
         kind: "evidence_request",
         summary: `${caseRow.company_name ?? "Merchant"} is asking for more evidence: ${body.slice(0, 200)}`,
         detail: { merchantText: body.slice(0, 400) },
@@ -838,7 +935,7 @@ export async function ingestMerchantMessage(
     }
     default: {
       await transitionIfAble(db, caseRow.id, "WAITING_FOR_COMPANY", "reply received; no immediate action needed");
-      await scheduleFollowUp(db, caseRow.id, "check_commitment", addMs(nowIso(), 2 * 24 * 3600 * 1000));
+      await scheduleFollowUp(db, caseRow.id, "check_commitment", addMs(nowIso(), 2 * 24 * 3600 * 1000), {}, env);
     }
   }
 }
@@ -870,6 +967,73 @@ async function transitionIfAble(db: D1Database, caseId: string, to: CaseState, r
 }
 
 // ---------------------------------------------------------------------------
+// Spend-cap-safe model calls (§11). SpendCapError never escapes as a crash:
+//  - case scope  → pause + 'spend_cap' approval; 'continue' raises the ceiling
+//  - unverified  → pause; the verification email is (re)sent to the customer
+//  - user/global → pause + fraud signal + alert to ADMIN_EMAILS
+// ---------------------------------------------------------------------------
+
+async function modelOrCap(
+  env: Env,
+  ctx: { userId: string; caseId?: string },
+  req: Parameters<typeof runModel>[2],
+  caseRow: CaseRow,
+): Promise<Awaited<ReturnType<typeof runModel>> | null> {
+  try {
+    return await runModel(env, ctx, req);
+  } catch (e) {
+    if (e instanceof SpendCapError) {
+      await handleSpendCap(env, caseRow, e.scope);
+      return null;
+    }
+    throw e;
+  }
+}
+
+async function handleSpendCap(env: Env, caseRow: CaseRow, scope: SpendCapError["scope"]): Promise<void> {
+  const db = env.DB;
+  if (scope === "case") {
+    await createApproval(env, caseRow.id, {
+      kind: "spend_cap",
+      summary: "This case used up its per-case model budget ($0.50). Spend another $0.50 on it?",
+      detail: { softCapMicroUsd: 500_000 },
+      options: [
+        { id: "continue", label: "Continue (+$0.50)", kind: "approve" },
+        { id: "stop", label: "Pause — don't spend more", kind: "reject" },
+      ],
+    });
+  } else if (scope === "unverified") {
+    const user = await q1<{ email: string }>(db, `SELECT email FROM users WHERE id = ?`, caseRow.user_id);
+    if (user) await sendVerificationEmail(env, caseRow.user_id, user.email).catch(() => {});
+    await createApproval(env, caseRow.id, {
+      kind: "email_verify_to_continue",
+      summary: "Verify your email address so the case can continue — a new verification link was just sent.",
+      detail: {},
+      options: [{ id: "acknowledged", label: "I'll verify it", kind: "approve" }],
+    });
+  } else {
+    await recordFraudSignal(db, {
+      userId: caseRow.user_id, caseId: caseRow.id,
+      kind: `spend_cap_${scope}`,
+      detail: `hard stop — ${scope} daily cap reached`,
+    });
+    const admins = (env.ADMIN_EMAILS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+    for (const a of admins) {
+      await sendSystemEmail(env, a, `[spend-cap] ${scope} daily cap hit`, `user=${caseRow.user_id} case=${caseRow.id}`).catch(() => {});
+    }
+    await caseEvent(db, caseRow.id, "model_blocked", "system", { reason: `${scope} daily spend cap reached — paused until tomorrow` });
+  }
+  await run(
+    db,
+    `UPDATE cases SET paused = 1, updated_at = ?, meta = json_set(COALESCE(meta,'{}'),'$.paused_reason', ?) WHERE id = ?`,
+    nowIso(),
+    scope === "unverified" ? "email_unverified" : `spend_cap_${scope}`,
+    caseRow.id,
+  );
+  await caseEvent(db, caseRow.id, "case_paused", "system", { reason: `spend_cap:${scope}` });
+}
+
+// ---------------------------------------------------------------------------
 // Durable follow-up sweep — invoked by the cron trigger. For each due item:
 // re-check whether the merchant's commitment was fulfilled; if not, send a
 // follow-up through the adapter (bounded by mandate); if denied/ignored past
@@ -888,30 +1052,123 @@ export async function runFollowUpSweep(env: Env): Promise<{ fired: number; deadl
   for (const f of due) {
     const caseRow = await getCase(env.DB, f.case_id);
     if (!caseRow || caseRow.paused || ["RESOLVED", "CANCELLED", "UNRESOLVED", "UNSUPPORTED"].includes(caseRow.status)) {
-      await markFired(env.DB, f.id);
+      // Guard claim — only the claim winner closes the ledger; a 'claimed'
+      // row left undismissed would look stranded to the recovery backstop.
+      if (await markFired(env.DB, f.id)) {
+        await recordEffect(env.DB, f.case_id, f.id, "dismissed", "case missing, paused or terminal — no follow-up sent");
+      }
       continue;
     }
     const mandate = await getActiveMandate(env.DB, f.case_id);
     if (!mandate) {
-      await markFired(env.DB, f.id);
+      if (await markFired(env.DB, f.id)) {
+        await recordEffect(env.DB, f.case_id, f.id, "dismissed", "no active mandate — no follow-up sent");
+      }
       continue;
     }
-    await markFired(env.DB, f.id);
+    // Atomic claim — the workflow path may have already fired this follow-up.
+    if (!(await markFired(env.DB, f.id))) continue;
     fired++;
+    try {
+      await runFollowUpFire(env, f.case_id, f.kind, f.id);
+    } catch (e) {
+      // Post-claim failure stays visible: 'unknown' is recoverable (the action
+      // key is idempotent), so the backstop below can reconcile it bounded.
+      await recordEffect(env.DB, f.case_id, f.id, "unknown", e instanceof Error ? e.message : String(e));
+      await reportError(env, e, { route: "cron/followup_sweep", kind: "followup_fire", caseId: f.case_id });
+    }
+  }
+  await recoverStrandedEffects(env);
+  return { fired, deadlines };
+}
 
-    const outcome = await latestOutcome(env.DB, f.case_id);
-    if (outcome && ["RECEIVED", "VERIFIED_RESOLVED", "DENIED", "UNRESOLVED"].includes(outcome.status)) {
+// ---------------------------------------------------------------------------
+// WO-2 recovery backstop: rows claimed whose effect never reached a terminal
+// state (crash/throw between claim and completion) are re-driven once per
+// sweep after a grace window — the cutoff keeps live in-flight attempts from
+// being stolen. Bounded by RECOVERY_ATTEMPT_CAP: at the cap the effect is
+// dismissed for manual reconcile rather than reclaimed forever. Recovery
+// never replays an ambiguous external effect — the deterministic case_actions
+// idempotency key makes a re-run re-attach to the same action row, and the
+// unkeyed customer notify is suppressed on re-attempts.
+// ---------------------------------------------------------------------------
+const RECOVERY_GRACE_MS = 10 * 60 * 1000;
+const RECOVERY_ATTEMPT_CAP = 5;
+const TERMINAL_CASE_STATES = ["RESOLVED", "CANCELLED", "UNRESOLVED", "UNSUPPORTED"];
+
+async function recoverStrandedEffects(env: Env): Promise<void> {
+  const cutoff = addMs(nowIso(), -RECOVERY_GRACE_MS);
+  for (const s of await strandedEffects(env.DB, cutoff)) {
+    const row = await q1<{ attempt: number }>(
+      env.DB,
+      `SELECT attempt FROM follow_ups WHERE id = ?`,
+      s.id,
+    );
+    if ((row?.attempt ?? 0) >= RECOVERY_ATTEMPT_CAP) {
+      await recordEffect(env.DB, s.case_id, s.id, "dismissed", `recovery cap ${RECOVERY_ATTEMPT_CAP} reached — manual reconcile needed`);
       continue;
     }
-
-    await transitionIfAble(env.DB, f.case_id, "FOLLOW_UP_DUE", "follow-up due");
-    // Propose a follow-up send; the policy engine re-gates it.
-    const key = `${f.case_id}:followup:${f.id}`;
-    await proposeAction(env.DB, f.case_id, "send_followup", { followUpId: f.id }, key);
-    await transitionIfAble(env.DB, f.case_id, "IN_PROGRESS", "processing follow-up");
-    await advanceCase(env, f.case_id, `followup:${f.id}`);
+    if (!(await claimForRecovery(env.DB, s.id, cutoff))) continue;
+    const caseRow = await getCase(env.DB, s.case_id);
+    if (!caseRow || caseRow.paused || TERMINAL_CASE_STATES.includes(caseRow.status) || !(await getActiveMandate(env.DB, s.case_id))) {
+      await recordEffect(env.DB, s.case_id, s.id, "dismissed", "recovered lease — case no longer eligible");
+      continue;
+    }
+    try {
+      await runFollowUpFire(env, s.case_id, s.kind, s.id, { reattempt: true });
+    } catch (e) {
+      await recordEffect(env.DB, s.case_id, s.id, "unknown", e instanceof Error ? e.message : String(e));
+      await reportError(env, e, { route: "cron/followup_sweep", kind: "followup_recover", caseId: s.case_id });
+    }
   }
-  return { fired, deadlines };
+}
+
+// One follow-up fire, shared by the cron sweep and the CaseWorkflow path
+// (M9): the caller has already claimed the row via markFired (or a bounded
+// claimForRecovery re-lease). WO-2: when followUpId is known, the effect
+// ledger records attempted → accepted → reconciled/dismissed here; a throw
+// before reconciliation is journaled 'unknown' by the caller. `reattempt`
+// marks a recovery re-run — the deterministic action key still re-attaches,
+// but unkeyed customer-facing effects (the money check-in notify) are
+// suppressed so an ambiguous external effect is never blindly replayed.
+export async function runFollowUpFire(
+  env: Env,
+  caseId: string,
+  kind: string,
+  followUpId?: string,
+  opts: { reattempt?: boolean } = {},
+): Promise<void> {
+  const effect = (
+    state: "attempted" | "accepted" | "reconciled" | "dismissed",
+    note?: string,
+  ) => (followUpId ? recordEffect(env.DB, caseId, followUpId, state, note) : Promise.resolve());
+  await effect("attempted");
+
+  const caseRow = await getCase(env.DB, caseId);
+  // Money check-in: commitment due means the customer should hear about it.
+  if (kind === "check_commitment" && caseRow && !opts.reattempt) {
+    await notify(env, caseRow.user_id, "money_checkin", {
+      caseId,
+      subject: "Did the money land?",
+      body: "The company's promised date is here. Open the app and confirm whether the money arrived — it takes ten seconds.",
+    }).catch(() => {});
+  }
+
+  const outcome = await latestOutcome(env.DB, caseId);
+  if (outcome && ["RECEIVED", "VERIFIED_RESOLVED", "DENIED", "UNRESOLVED"].includes(outcome.status)) {
+    await effect("dismissed", "outcome already terminal — nothing to send");
+    return;
+  }
+
+  await transitionIfAble(env.DB, caseId, "FOLLOW_UP_DUE", "follow-up due");
+  // Propose a follow-up send; the policy engine re-gates it. The deterministic
+  // key is the idempotency anchor: a recovery re-run finds the same row.
+  const key = `${caseId}:followup:${followUpId ?? newId("fup")}`;
+  await proposeAction(env.DB, caseId, "send_followup", { followUpId }, key);
+  await effect("accepted", key);
+  await transitionIfAble(env.DB, caseId, "IN_PROGRESS", "processing follow-up");
+  await advanceCase(env, caseId, `followup:${followUpId ?? "wf"}`);
+  await effect("reconciled", key);
 }
 
 // ---------------------------------------------------------------------------
@@ -919,7 +1176,7 @@ export async function runFollowUpSweep(env: Env): Promise<{ fired: number; deadl
 // case according to what they chose.
 // ---------------------------------------------------------------------------
 
-export async function handleApprovalDecision(env: Env, approvalId: string): Promise<void> {
+export async function handleApprovalDecision(env: Env, approvalId: string, payload: { amountCents?: number } = {}): Promise<void> {
   const db = env.DB;
   const row = await q1<{
     id: string; case_id: string; action_id: string | null; kind: string;
@@ -931,14 +1188,80 @@ export async function handleApprovalDecision(env: Env, approvalId: string): Prom
   if (!caseRow) return;
 
   if (row.kind === "confirm_receipt") {
-    if (row.resolved_option === "received") {
-      await recordOutcome(db, row.case_id, "VERIFIED_RESOLVED", "Customer confirmed receipt. Case closed.", { actor: "customer" });
-      await transitionIfAble(db, row.case_id, "RESOLVED", "customer confirmed resolution");
-      await cancelFollowUps(db, row.case_id);
+    if (row.resolved_option === "received" || row.resolved_option === "partial") {
+      // M4: self-report is RECEIVED (CUSTOMER_CONFIRMED) — never the top tier.
+      // VERIFIED_RESOLVED additionally requires document-verified money.
+      const claimed = caseRow.amount_cents ?? 0;
+      const cents = row.resolved_option === "partial"
+        ? Math.max(0, Math.min(payload.amountCents ?? 0, claimed || Number.MAX_SAFE_INTEGER))
+        : claimed;
+      await recordReceipt(db, row.case_id, {
+        source: "customer_confirmed",
+        amountCents: cents,
+        detail: row.resolved_option === "partial"
+          ? `Customer confirmed a partial receipt${cents ? ` of $${(cents / 100).toFixed(2)}` : ""}.`
+          : "Customer confirmed receipt — self-reported, not document-verified.",
+      });
+      await createApproval(env, row.case_id, {
+        kind: "verify_receipt",
+        summary: row.resolved_option === "partial"
+          ? "Partial receipt recorded. Add the refund-confirmation email or screenshot on the case page to document-verify it — and keep pursuing the rest, or close here?"
+          : "Receipt recorded as customer-confirmed. To reach document-verified status, add the refund-confirmation email or bank-statement screenshot on the case page. Close the case now or keep pursuing?",
+        detail: { receiptTier: "customer_confirmed" },
+        options: [
+          { id: "close", label: "Close the case", kind: "approve" },
+          { id: "keep_following", label: "Keep following up", kind: "reject" },
+        ],
+      });
+      await transitionIfAble(db, row.case_id, "RESOLUTION_PROPOSED", "receipt confirmed — awaiting close or document verification");
     } else {
       await recordOutcome(db, row.case_id, "REQUESTED", "Customer: not received yet — continuing to follow up.", { actor: "customer" });
-      await scheduleFollowUp(db, row.case_id, "check_commitment", addMs(nowIso(), 24 * 3600 * 1000));
+      await scheduleFollowUp(db, row.case_id, "check_commitment", addMs(nowIso(), 24 * 3600 * 1000), {}, env);
       await transitionIfAble(db, row.case_id, "WAITING_FOR_COMPANY", "customer has not received resolution");
+    }
+    return;
+  }
+
+  if (row.kind === "verify_receipt") {
+    const { tier } = await receiptState(db, row.case_id);
+    if (row.resolved_option === "close") {
+      if (tier === "document_verified") {
+        await recordOutcome(db, row.case_id, "VERIFIED_RESOLVED", "Document-verified receipt + customer confirmed resolution. Case closed.", { actor: "customer" });
+      }
+      await finalizeResults(db, row.case_id);
+      await transitionIfAble(db, row.case_id, "RESOLVED",
+        tier === "document_verified"
+          ? "verified resolved — document + customer confirm"
+          : "resolved on customer confirmation alone — no document on file");
+      await cancelFollowUps(db, row.case_id);
+      const u1 = await q1<{ user_id: string }>(db, `SELECT user_id FROM cases WHERE id = ?`, row.case_id);
+      if (u1) await notify(env, u1.user_id, "case_resolved", { caseId: row.case_id, subject: "Your case is resolved", body: "The case was closed as resolved. The full record is in the app." }).catch(() => {});
+    } else {
+      await recordOutcome(db, row.case_id, "REQUESTED", "Customer: continuing to pursue the remainder.", { actor: "customer" });
+      await scheduleFollowUp(db, row.case_id, "check_commitment", addMs(nowIso(), 24 * 3600 * 1000), {}, env);
+      await transitionIfAble(db, row.case_id, "WAITING_FOR_COMPANY", "customer pursuing remainder after partial receipt");
+    }
+    return;
+  }
+
+  if (row.kind === "confirm_resolution") {
+    const { tier } = await receiptState(db, row.case_id);
+    if (row.resolved_option === "resolved") {
+      if (tier === "document_verified") {
+        await recordOutcome(db, row.case_id, "VERIFIED_RESOLVED", "Document-verified receipt + customer confirmed resolution. Case closed.", { actor: "customer" });
+      }
+      await finalizeResults(db, row.case_id);
+      await transitionIfAble(db, row.case_id, "RESOLVED",
+        tier === "document_verified"
+          ? "verified resolved — document + customer confirm"
+          : "resolved without document verification — stays at customer-confirmed tier");
+      await cancelFollowUps(db, row.case_id);
+      const u2 = await q1<{ user_id: string }>(db, `SELECT user_id FROM cases WHERE id = ?`, row.case_id);
+      if (u2) await notify(env, u2.user_id, "case_resolved", { caseId: row.case_id, subject: "Your case is resolved", body: "The case was closed as resolved. The full record is in the app." }).catch(() => {});
+    } else {
+      await recordOutcome(db, row.case_id, "REQUESTED", "Customer: document-verified receipt does not fully resolve the case — continuing.", { actor: "customer" });
+      await scheduleFollowUp(db, row.case_id, "check_commitment", addMs(nowIso(), 24 * 3600 * 1000), {}, env);
+      await transitionIfAble(db, row.case_id, "WAITING_FOR_COMPANY", "customer says receipt is incomplete");
     }
     return;
   }
@@ -968,6 +1291,24 @@ export async function handleApprovalDecision(env: Env, approvalId: string): Prom
     return;
   }
 
+  if (row.kind === "spend_cap") {
+    if (row.status === "approved" && row.resolved_option === "continue") {
+      // Customer-authorized ceiling raise — attributable, persisted in meta.
+      await bumpCaseSpendCap(db, row.case_id, 500_000);
+      await run(db, `UPDATE cases SET paused = 0, updated_at = ? WHERE id = ?`, nowIso(), row.case_id);
+      await caseEvent(db, row.case_id, "case_resumed", "customer", { reason: "spend cap raised +$0.50" });
+      await advanceCase(env, row.case_id, "spend_cap_continue");
+    }
+    // 'stop' leaves the case paused — resuming is a customer action.
+    return;
+  }
+
+  if (row.kind === "email_verify_to_send" || row.kind === "email_verify_to_continue") {
+    // Acknowledgement only — the case unpauses when the customer verifies
+    // (verify-email flow clears it) or manually resumes.
+    return;
+  }
+
   // action_approval (generic gated action)
   if (row.action_id) {
     if (row.status === "approved") {
@@ -993,7 +1334,7 @@ export async function handleApprovalDecision(env: Env, approvalId: string): Prom
         // Declining a draft isn't a resolution — the case just keeps waiting.
         await caseEvent(db, row.case_id, "draft_declined", "customer", { actionId: row.action_id, kind: act.kind });
         await transitionIfAble(db, row.case_id, "WAITING_FOR_COMPANY", "customer declined the draft — continuing with the merchant");
-        await scheduleFollowUp(db, row.case_id, "check_commitment", addMs(nowIso(), 2 * 24 * 3600 * 1000));
+        await scheduleFollowUp(db, row.case_id, "check_commitment", addMs(nowIso(), 2 * 24 * 3600 * 1000), {}, env);
       } else {
         await recordOutcome(db, row.case_id, "UNRESOLVED", "Customer declined the proposed action.", { actor: "customer" });
       }

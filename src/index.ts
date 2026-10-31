@@ -7,7 +7,7 @@ import {
   runFollowUpSweep,
   suggestedMandate,
 } from "./core/agent";
-import { decideApproval, pendingApprovals } from "./core/approvals";
+import { createApproval, decideApproval, pendingApprovals } from "./core/approvals";
 import { getCase, transitionCase } from "./core/caseEngine";
 import { addEvidence, claimView, evidenceView, listClaims, listEvidence } from "./core/evidence";
 import { addMs, json, nowIso, q, q1, run } from "./core/db";
@@ -15,6 +15,7 @@ import { caseEvent, auditEvent } from "./core/events";
 import { cancelFollowUps, scheduleFollowUp } from "./core/followups";
 import { activateMandate, createMandate, getLatestMandate, revokeMandate } from "./core/mandate";
 import { latestOutcome } from "./core/outcomes";
+import { aggregateResults, patchResults, receiptState, recordReceipt, derivedResults, getResultsMeta, RECEIPT_TIER_LABELS } from "./core/results";
 import { addDeadline } from "./core/escalation";
 import { gatherCaseFacts, renderBundleLines } from "./core/templates";
 import { buildPdf } from "./core/pdf";
@@ -22,8 +23,19 @@ import { seedRegistry } from "./adapters/registry";
 import { extractMessageIds, resolveInboundCase } from "./email/threading";
 import PostalMime from "postal-mime";
 import { encryptJson } from "./security/crypto";
-import { getSession, requireCsrf, signin, signout, signup } from "./http/auth";
+import { createSession, getSession, requireCsrf, signin, signout, signup } from "./http/auth";
 import { handleCompanion } from "./http/companion";
+import {
+  confirmPasswordReset, getNotificationPrefs, requestPasswordReset,
+  resendVerification, setNotificationPref, totpChallengeFor, totpChallengeRedeem,
+  totpConfirm, totpDisable, totpEnroll, verifyEmailLink,
+} from "./http/account";
+import { consumeUserToken, countRecentTokens, issueUserToken, sendVerificationEmail, sendSystemEmail } from "./core/notify";
+import { healthCheckDue, runDirectoryHealthCheck } from "./adapters/directory";
+import { backupDue, inboundRawKey, reportError, runDailyBackup } from "./core/ops";
+import type { InboundQueueMessage } from "./core/ops";
+export { CaseWorkflow } from "./core/caseWorkflow";
+import { activeCaseCount, MAX_ACTIVE_CASES_PER_USER, recordFraudSignal } from "./core/abuse";
 import { STATIC_FILES } from "./static";
 
 // --------------------------------------------------------------------------
@@ -38,6 +50,28 @@ function res(body: unknown, init: ResponseInit = {}): Response {
 }
 const err = (status: number, error: string) => res({ error }, { status });
 
+// Turnstile: enforced only when the secret is configured — dev/tests without
+// it pass through (the widget can't render without a site key anyway).
+async function verifyTurnstile(env: Env, token: string | undefined, req: Request): Promise<boolean> {
+  if (!env.TURNSTILE_SECRET) return true;
+  if (!token) return false;
+  try {
+    const r = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        secret: env.TURNSTILE_SECRET,
+        response: token,
+        remoteip: req.headers.get("cf-connecting-ip") ?? undefined,
+      }),
+    });
+    const d = (await r.json()) as { success?: boolean };
+    return d.success === true;
+  } catch {
+    return false;
+  }
+}
+
 type Ctx = { env: Env; url: URL; session: { userId: string; csrf: string; token: string } | null };
 
 async function api(req: Request, ctx: Ctx): Promise<Response> {
@@ -46,21 +80,86 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
   const secure = url.protocol === "https:";
 
   // ---- auth (unauthenticated) ----
+  // Signup prerequisites surfaced without a session: Turnstile site key when
+  // the secret is configured server-side (else the widget never renders).
+  if (path === "/api/auth/config" && req.method === "GET") {
+    return res({ turnstileSiteKey: env.TURNSTILE_SECRET ? (env.TURNSTILE_SITE_KEY ?? null) : null });
+  }
   if (path === "/api/auth/signup" && req.method === "POST") {
-    const b = (await req.json()) as { email?: string; password?: string };
+    const b = (await req.json()) as { email?: string; password?: string; consent?: boolean; turnstile?: string };
+    if (b.consent !== true) return err(400, "consent to the Terms and Privacy Policy is required");
+    if (!(await verifyTurnstile(env, b.turnstile, req))) return err(400, "human check failed — try again");
     const r = await signup(env.DB, b.email ?? "", b.password ?? "");
     if (!r.ok) return err(400, r.error);
-    const s = await signin(env.DB, b.email!, b.password!, secure);
+    await run(env.DB, `UPDATE users SET tos_accepted_at = ? WHERE id = ?`, nowIso(), r.userId);
+    await sendVerificationEmail(env, r.userId, b.email!.trim().toLowerCase());
+    const s = await signin(env.DB, b.email!, b.password!);
     if (!s.ok) return err(500, "auto sign-in failed");
-    return res({ ok: true, csrf: s.csrf }, { headers: { "Set-Cookie": s.cookie } });
+    const sess = await createSession(env.DB, s.userId, secure);
+    return res({ ok: true, csrf: sess.csrf, emailVerified: false }, { headers: { "Set-Cookie": sess.cookie } });
   }
   if (path === "/api/auth/signin" && req.method === "POST") {
     const b = (await req.json()) as { email?: string; password?: string };
-    const s = await signin(env.DB, b.email ?? "", b.password ?? "", secure);
+    const s = await signin(env.DB, b.email ?? "", b.password ?? "");
     if (!s.ok) return err(401, s.error);
-    return res({ ok: true, csrf: s.csrf }, { headers: { "Set-Cookie": s.cookie } });
+    // TOTP gate — password verified but the second factor decides the session.
+    const t = await totpChallengeFor(env, s.userId);
+    if (t.required) return res({ ok: true, totpRequired: true, ticket: t.ticket });
+    const sess = await createSession(env.DB, s.userId, secure);
+    return res({ ok: true, csrf: sess.csrf }, { headers: { "Set-Cookie": sess.cookie } });
+  }
+  if (path === "/api/auth/totp/challenge" && req.method === "POST") {
+    const b = (await req.json()) as { ticket?: string; code?: string };
+    const r = await totpChallengeRedeem(env, b.ticket ?? "", b.code ?? "");
+    if (!r.ok) return err(401, r.error ?? "challenge failed");
+    const sess = await createSession(env.DB, r.userId!, secure);
+    return res({ ok: true, csrf: sess.csrf }, { headers: { "Set-Cookie": sess.cookie } });
+  }
+  // One-shot email verification link — marks verified, then bounces into the
+  // SPA. No session needed (the token IS the proof).
+  if (path === "/api/auth/verify-email" && req.method === "GET") {
+    return verifyEmailLink(env, url.searchParams.get("token") ?? "");
+  }
+  if (path === "/api/auth/reset-request" && req.method === "POST") {
+    const b = (await req.json()) as { email?: string };
+    if (b.email) await requestPasswordReset(env, b.email);
+    return res({ ok: true });
+  }
+  if (path === "/api/auth/reset-confirm" && req.method === "POST") {
+    const b = (await req.json()) as { token?: string; password?: string };
+    const r = await confirmPasswordReset(env, b.token ?? "", b.password ?? "");
+    if (!r.ok) return err(400, r.error ?? "reset failed");
+    return res({ ok: true });
+  }
+  // Public abuse inbox — §11. Stored as a fraud signal; rate-limited by
+  // reporter address so the inbox itself can't be flooded.
+  if (path === "/api/abuse/report" && req.method === "POST") {
+    const b = (await req.json()) as { email?: string; caseId?: string; body?: string };
+    const body = (b.body ?? "").trim();
+    if (body.length < 10) return err(400, "tell us what happened in a sentence or two");
+    const reporter = (b.email ?? "anonymous").trim().toLowerCase().slice(0, 120);
+    const recent = await q1<{ n: number }>(
+      env.DB,
+      `SELECT COUNT(*) AS n FROM fraud_signals WHERE kind = 'abuse_report' AND detail LIKE ? AND created_at >= ?`,
+      `%${reporter}%`,
+      new Date(Date.now() - 24 * 3600 * 1000).toISOString(),
+    );
+    if ((recent?.n ?? 0) >= 5) return err(429, "too many reports — we have yours, thanks");
+    await recordFraudSignal(env.DB, {
+      userId: "public", caseId: b.caseId ?? null,
+      kind: "abuse_report",
+      detail: `reporter=${reporter} :: ${body.slice(0, 400)}`,
+    });
+    return res({ ok: true });
   }
   if (path === "/api/health") return res({ ok: true, service: "company-service", time: nowIso() });
+
+  // Public results aggregate — counts/medians only, merchant buckets under the
+  // sample floor merge into "other" so no single case is inferable. Powers the
+  // /results page; no per-case data is ever exposed here.
+  if (path === "/api/results" && req.method === "GET") {
+    return res(await aggregateResults(env.DB));
+  }
 
   // Chat-companion routes have their own auth (bearer pairing tokens for the
   // extension; session+CSRF for management) and must run before the global
@@ -78,9 +177,104 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
     return res({ ok: true }, { headers: { "Set-Cookie": cookie } });
   }
   if (path === "/api/auth/me") {
-    const user = await q1<{ id: string; email: string; created_at: string }>(
-      env.DB, `SELECT id, email, created_at FROM users WHERE id = ?`, uid);
-    return res({ user, csrf: session.csrf });
+    const user = await q1<{ id: string; email: string; created_at: string; email_verified_at: string | null; totp_secret_enc: string | null; tos_accepted_at: string | null }>(
+      env.DB, `SELECT id, email, created_at, email_verified_at, totp_secret_enc, tos_accepted_at FROM users WHERE id = ?`, uid);
+    return res({
+      user: user && {
+        ...user,
+        totp_secret_enc: undefined,
+        emailVerified: !!user.email_verified_at,
+        totpEnabled: !!user.totp_secret_enc?.startsWith("enc:"),
+        tosAcceptedAt: user.tos_accepted_at,
+      },
+      csrf: session.csrf,
+    });
+  }
+
+  // ---- M7 account security ----
+  if (path === "/api/auth/verify-email/resend" && req.method === "POST") {
+    const r = await resendVerification(env, uid);
+    if (!r.ok) return err(400, r.error ?? "could not resend");
+    return res({ ok: true });
+  }
+  if (path === "/api/auth/totp/enroll" && req.method === "POST") {
+    const r = await totpEnroll(env, uid);
+    if (!r.ok) return err(400, r.error ?? "enroll failed");
+    return res({ ok: true, secret: r.secret, otpauth: r.otpauth });
+  }
+  if (path === "/api/auth/totp/confirm" && req.method === "POST") {
+    const b = (await req.json()) as { code?: string };
+    const r = await totpConfirm(env, uid, b.code ?? "");
+    if (!r.ok) return err(400, r.error ?? "confirm failed");
+    return res({ ok: true });
+  }
+  if (path === "/api/auth/totp/disable" && req.method === "POST") {
+    const b = (await req.json()) as { code?: string };
+    const r = await totpDisable(env, uid, b.code ?? "");
+    if (!r.ok) return err(400, r.error ?? "disable failed");
+    return res({ ok: true });
+  }
+  if (path === "/api/notifications/prefs" && req.method === "GET") {
+    return res({ prefs: await getNotificationPrefs(env, uid) });
+  }
+  if (path === "/api/notifications/prefs" && req.method === "PUT") {
+    const b = (await req.json()) as { kind?: string; enabled?: boolean };
+    const r = await setNotificationPref(env, uid, b.kind ?? "", b.enabled === true);
+    if (!r.ok) return err(400, r.error ?? "pref failed");
+    return res({ ok: true });
+  }
+  if (path === "/api/forward-start/confirm" && req.method === "POST") {
+    if ((await activeCaseCount(env.DB, uid)) >= MAX_ACTIVE_CASES_PER_USER) {
+      return err(429, `case limit reached — resolve or pause an open case first (max ${MAX_ACTIVE_CASES_PER_USER} active)`);
+    }
+    const b = (await req.json()) as { token?: string };
+    const hit = await consumeUserToken(env.DB, b.token ?? "", "forward_start", uid);
+    const subject = typeof hit?.payload.subject === "string" ? hit.payload.subject : "";
+    const body = typeof hit?.payload.body === "string" ? hit.payload.body : "";
+    if (!hit || body.trim().length < 5) return err(400, "confirmation link is invalid or expired");
+    const create = await createCaseFromText(
+      env,
+      uid,
+      `${subject ? `Fwd: ${subject}\n\n` : ""}${body}`.slice(0, 8000),
+    );
+    await ingestInboundText(env, create.caseId, body, {
+      subject,
+      externalId: typeof hit.payload.messageId === "string" ? hit.payload.messageId : null,
+      meta: {
+        channel: "email",
+        from: typeof hit.payload.from === "string" ? hit.payload.from : "",
+        to: typeof hit.payload.to === "string" ? hit.payload.to : "",
+        confirmation: "signed_in_account_holder",
+      },
+    });
+    await auditEvent(env.DB, {
+      type: "forward_to_start_confirmed", severity: "info", userId: uid, caseId: create.caseId,
+      data: { messageId: hit.payload.messageId ?? null },
+    });
+    return res({ ok: true, caseId: create.caseId });
+  }
+
+  // Owner-only per-case results detail (M4). Gated by ADMIN_EMAILS binding
+  // (comma-separated); unset → 404, same as a missing route.
+  if (path === "/api/admin/results" && req.method === "GET") {
+    const admins = (env.ADMIN_EMAILS ?? "").split(",").map((e) => e.trim().toLowerCase()).filter(Boolean);
+    const me = await q1<{ email: string }>(env.DB, `SELECT email FROM users WHERE id = ?`, uid);
+    if (!admins.length || !me || !admins.includes(me.email.toLowerCase())) return err(404, "not found");
+    const rows = await q(
+      env.DB,
+      `SELECT id, title, company_name, status, amount_cents, meta, created_at FROM cases ORDER BY created_at DESC LIMIT 500`,
+    );
+    const cases = [];
+    for (const r of rows as { id: string; title: string; company_name: string | null; status: string; amount_cents: number | null; meta: string | null; created_at: string }[]) {
+      const { tier, amountRecoveredCents } = await receiptState(env.DB, r.id);
+      cases.push({
+        id: r.id, title: r.title, company: r.company_name, status: r.status,
+        amountCents: r.amount_cents, receiptTier: tier, amountRecoveredCents,
+        results: (json<Record<string, unknown>>(r.meta ?? "{}", {}).results ?? {}),
+        createdAt: r.created_at,
+      });
+    }
+    return res({ cases });
   }
 
   // ---- cases ----
@@ -95,12 +289,29 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
     return res({ cases, pendingApprovals: pending.length });
   }
   if (path === "/api/cases" && req.method === "POST") {
-    const b = (await req.json()) as { text?: string; scenario?: string };
+    const b = (await req.json()) as {
+      text?: string; scenario?: string;
+      startingState?: { daysOverdue?: number; priorAttempts?: number; refundInProgress?: boolean };
+    };
     if (!b.text || b.text.trim().length < 5) return err(400, "describe the problem in a sentence or two");
+    // §11: no unattended fan-out — a user tops out at 10 active cases.
+    if ((await activeCaseCount(env.DB, uid)) >= MAX_ACTIVE_CASES_PER_USER) {
+      return err(429, `case limit reached — resolve or pause an open case first (max ${MAX_ACTIVE_CASES_PER_USER} active)`);
+    }
     const { caseId, objective } = await createCaseFromText(env, uid, b.text.trim());
     if (b.scenario) {
       await run(env.DB, `UPDATE cases SET meta = json_set(COALESCE(meta, '{}'), '$.scenario', ?) WHERE id = ?`, b.scenario, caseId);
     }
+    // M4/R8 starting state — CUSTOMER_STATED at intake, feeds M8 attribution.
+    await patchResults(env.DB, caseId, {
+      amount_claimed: objective.amountCents ?? null,
+      ...(typeof b.startingState?.daysOverdue === "number"
+        ? { days_overdue_at_start: Math.max(0, Math.round(b.startingState.daysOverdue)) } : {}),
+      ...(typeof b.startingState?.priorAttempts === "number"
+        ? { prior_customer_attempts: Math.max(0, Math.round(b.startingState.priorAttempts)) } : {}),
+      ...(typeof b.startingState?.refundInProgress === "boolean"
+        ? { refund_already_in_progress: b.startingState.refundInProgress } : {}),
+    });
     await caseEvent(env.DB, caseId, "intake_completed", "agent", { objective });
     return res({ caseId, objective, suggestedMandate: suggestedMandate(objective) });
   }
@@ -141,6 +352,69 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
       });
       return res({ id });
     }
+    // M4: refund-confirmation document → RECEIVED (DOCUMENT_VERIFIED) tier.
+    // Accepts pasted text (forwarded email) or an existing evidence id (file
+    // already uploaded via /evidence). Amounts: parsed from the document when
+    // possible, else the customer-entered amount — the document itself is the
+    // verification, not the parsed figure.
+    if (sub === "/receipt-evidence" && req.method === "POST") {
+      const b = (await req.json()) as { text?: string; evidenceId?: string; amountCents?: number };
+      let evidenceId: string;
+      let docText: string | null = null;
+      if (b.evidenceId) {
+        const ev = await q1<{ id: string; text: string | null }>(
+          env.DB, `SELECT id, text FROM case_evidence WHERE id = ? AND case_id = ?`, b.evidenceId, caseId);
+        if (!ev) return err(404, "evidence not found on this case");
+        evidenceId = ev.id;
+        docText = ev.text;
+      } else if (b.text?.trim()) {
+        docText = b.text.trim();
+        evidenceId = await addEvidence(env.DB, env, caseId, {
+          kind: "receipt",
+          text: docText,
+          source: "customer",
+          label: "Refund confirmation (document)",
+        });
+      } else {
+        return err(400, "provide pasted text or an evidenceId");
+      }
+      let cents = typeof b.amountCents === "number" && b.amountCents > 0 ? Math.round(b.amountCents) : null;
+      if (cents === null && docText) {
+        const m = docText.match(/\$\s*([0-9][0-9,]*(?:\.[0-9]{2})?)/);
+        if (m) cents = Math.round(Number(m[1]!.replace(/,/g, "")) * 100);
+      }
+      if (cents === null) {
+        const c = await q1<{ amount_cents: number | null }>(env.DB, `SELECT amount_cents FROM cases WHERE id = ?`, caseId);
+        cents = c?.amount_cents ?? 0;
+      }
+      await recordReceipt(env.DB, caseId, {
+        source: "document_verified",
+        amountCents: cents,
+        detail: "Refund-confirmation document stored — receipt is document-verified.",
+        evidenceId,
+      });
+      await caseEvent(env.DB, caseId, "receipt_document_verified", "customer", { evidenceId, amountCents: cents });
+      // If no resolution confirmation is pending, ask whether this resolves
+      // the case — VERIFIED_RESOLVED only lands on customer confirm.
+      const pendingRes = await q1<{ id: string }>(
+        env.DB,
+        `SELECT id FROM approval_requests WHERE case_id = ? AND kind IN ('confirm_resolution','verify_receipt') AND status = 'pending'`,
+        caseId,
+      );
+      if (!pendingRes) {
+        await createApproval(env, caseId, {
+          kind: "confirm_resolution",
+          summary: "Your receipt is document-verified. Does this fully resolve the case?",
+          detail: { evidenceId, amountCents: cents },
+          options: [
+            { id: "resolved", label: "Yes — fully resolved, close it", kind: "approve" },
+            { id: "incomplete", label: "No — incomplete, keep working it", kind: "reject" },
+          ],
+        });
+      }
+      return res({ ok: true, evidenceId, amountCents: cents, tier: "document_verified" });
+    }
+
     const evFileMatch = sub.match(/^\/evidence\/([^/]+)\/file$/);
     if (evFileMatch && req.method === "GET") {
       const ev = await q1<{ r2_key: string | null; mime: string | null }>(
@@ -171,7 +445,7 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
       await caseEvent(env.DB, caseId, "assisted_sent", "customer", { actionId: act.id });
       await transitionCase(env.DB, caseId, "WAITING_FOR_COMPANY", { reason: "customer sent assisted message", actor: "customer" });
       // Wake the case if the merchant never replies.
-      await scheduleFollowUp(env.DB, caseId, "send_followup", addMs(nowIso(), 2 * 24 * 3600 * 1000), { via: "assisted" });
+      await scheduleFollowUp(env.DB, caseId, "send_followup", addMs(nowIso(), 2 * 24 * 3600 * 1000), { via: "assisted" }, env);
       return res({ ok: true });
     }
     if (sub === "/assisted/reply" && req.method === "POST") {
@@ -356,7 +630,7 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
   }
   const aprMatch = path.match(/^\/api\/approvals\/([^/]+)\/decide$/);
   if (aprMatch && req.method === "POST") {
-    const b = (await req.json()) as { optionId?: string };
+    const b = (await req.json()) as { optionId?: string; amountCents?: number };
     // Ownership check via case join.
     const row = await q1<{ case_id: string }>(
       env.DB,
@@ -365,7 +639,9 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
     if (!row) return err(404, "approval not found");
     const r = await decideApproval(env.DB, aprMatch[1]!, b.optionId ?? "", uid);
     if (!r.ok) return err(400, r.error ?? "decision failed");
-    await handleApprovalDecision(env, aprMatch[1]!);
+    await handleApprovalDecision(env, aprMatch[1]!, {
+      amountCents: typeof b.amountCents === "number" ? Math.max(0, Math.round(b.amountCents)) : undefined,
+    });
     return res({ ok: true });
   }
 
@@ -494,8 +770,11 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
 async function caseDetail(env: Env, caseId: string) {
   const c = await getCase(env.DB, caseId);
   const meta = json<{ orderRef?: string; trackingRef?: string; scenario?: string }>((c as Record<string, unknown> | null)?.meta as string | null, {});
-  const [claims, evidence, events, messages, mandate, outcome, approvals, actions, followups, costs, escalations, deadlines] =
+  const [receipt, resultsMeta, derived, claims, evidence, events, messages, mandate, outcome, approvals, actions, followups, costs, escalations, deadlines] =
     await Promise.all([
+      receiptState(env.DB, caseId),
+      getResultsMeta(env.DB, caseId),
+      derivedResults(env.DB, caseId),
       listClaims(env.DB, caseId),
       listEvidence(env.DB, caseId),
       q(env.DB, `SELECT * FROM case_events WHERE case_id = ? ORDER BY created_at ASC, rowid ASC`, caseId),
@@ -516,6 +795,8 @@ async function caseDetail(env: Env, caseId: string) {
     case: c,
     orderRef: meta.orderRef ?? null,
     trackingRef: meta.trackingRef ?? null,
+    receipt: { tier: receipt.tier, tierLabel: RECEIPT_TIER_LABELS[receipt.tier], amountRecoveredCents: receipt.amountRecoveredCents },
+    results: { ...resultsMeta, ...derived },
     claims: claims.map((r: Record<string, unknown>) => claimView(r)),
     evidence: evidence.map((r: Record<string, unknown>) => evidenceView(r)),
     events: events.map((r: Record<string, unknown>) => ({
@@ -609,29 +890,85 @@ async function ingestInboundText(
 // Full inbound pipeline for a parsed email (Email Routing handler + tests).
 // Returns 'processed' | 'duplicate' | 'rejected'. Rejected mail is bounced back
 // to the sender by setReject in the caller.
-export async function ingestInboundEmail(
-  env: Env,
-  parsed: {
-    to: string;
-    from?: string;
-    subject?: string;
-    body: string;
-    messageId?: string | null;
-    inReplyTo?: string | null;
-    references?: string | string[] | null;
-    attachments?: { filename: string; mimeType: string; content: ArrayBuffer | Uint8Array }[];
-  },
-): Promise<{ result: string; caseId?: string }> {
-  const inboundDomain = env.INBOUND_ADDRESS?.split("@")[1] ?? env.EMAIL_DOMAIN ?? "agentmasterkey.com";
+export interface InboundParsed {
+  to: string;
+  from?: string;
+  subject?: string;
+  body: string;
+  messageId?: string | null;
+  inReplyTo?: string | null;
+  references?: string | string[] | null;
+  attachments?: { filename: string; mimeType: string; content: ArrayBuffer | Uint8Array }[];
+}
 
-  // Domain guard: only mail addressed to our inbound domain is case mail.
+// The verified-sender check for case+new@ forward-to-start. Extracted so the
+// queue producer can decide "queueable vs bounce" without creating a case.
+async function forwardNewSender(env: Env, parsed: InboundParsed): Promise<{ id: string; email: string } | null> {
+  if (!/case\+new@/i.test(parsed.to)) return null;
+  const senderEmail = (parsed.from ?? "").trim().toLowerCase();
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(senderEmail)) return null;
+  const sender = await q1<{ id: string; email_verified_at: string | null }>(
+    env.DB,
+    `SELECT id, email_verified_at FROM users WHERE lower(email) = ?`,
+    senderEmail,
+  );
+  return sender?.email_verified_at ? { id: sender.id, email: senderEmail } : null;
+}
+
+async function sendForwardStartConfirmation(
+  env: Env,
+  sender: { id: string; email: string },
+  parsed: InboundParsed,
+): Promise<boolean> {
+  // A spoofed From header must not become an email-bomb primitive. Bound the
+  // number of pending confirmations sent to one account.
+  if ((await countRecentTokens(env.DB, sender.id, "forward_start", 3600_000)) >= 3) {
+    await auditEvent(env.DB, {
+      type: "forward_start_confirmation_limited", severity: "warning", userId: sender.id,
+      data: { from: parsed.from ?? "", to: parsed.to },
+    });
+    return false;
+  }
+  const token = await issueUserToken(env.DB, sender.id, "forward_start", 3600_000, {
+    subject: (parsed.subject ?? "").slice(0, 500),
+    body: parsed.body.slice(0, 8000),
+    from: (parsed.from ?? "").slice(0, 320),
+    to: parsed.to.slice(0, 320),
+    messageId: parsed.messageId ?? null,
+  });
+  const origin = env.APP_ORIGIN ?? `https://${env.EMAIL_DOMAIN ?? "agentmasterkey.com"}`;
+  const link = `${origin}/#/forward-confirm?token=${encodeURIComponent(token)}`;
+  const sent = await sendSystemEmail(
+    env,
+    sender.email,
+    "Confirm your forwarded email to start a case",
+    `We received a message claiming to be from your address. No case was created.\n\nIf you sent it, sign in and confirm within 1 hour:\n\n${link}\n\nIf you did not send it, ignore this email.`,
+  );
+  await auditEvent(env.DB, {
+    type: "forward_start_confirmation_sent", severity: sent.ok ? "info" : "warning",
+    userId: sender.id,
+    data: {
+      transport: sent.transport, ok: sent.ok,
+      ...(env.ENVIRONMENT !== "production" ? { devToken: token } : {}),
+    },
+  });
+  return sent.ok;
+}
+
+// Cheap synchronous preflight shared by the email() producer and the queue
+// consumer's full ingest: domain guard, message-id dedup, case resolution,
+// forward-to-start eligibility. No writes beyond audit rows.
+async function preflightInbound(
+  env: Env,
+  parsed: InboundParsed,
+): Promise<{ result: "rejected" | "duplicate" | "confirmation_required" | "ok"; caseId?: string; forwardSender?: { id: string; email: string } }> {
+  const inboundDomain = env.INBOUND_ADDRESS?.split("@")[1] ?? env.EMAIL_DOMAIN ?? "agentmasterkey.com";
   if (!parsed.to.toLowerCase().endsWith(`@${inboundDomain}`)) {
     await auditEvent(env.DB, { type: "inbound_wrong_domain", severity: "warning", data: { to: parsed.to } });
     return { result: "rejected" };
   }
-
-  // Idempotent: the same RFC message-id is never ingested twice, even if Email
-  // Routing retries delivery.
+  // Idempotent: the same RFC message-id is never ingested twice, even if the
+  // transport retries delivery (Email Routing or a queue redelivery).
   if (parsed.messageId) {
     const dup = await q1<{ id: string }>(
       env.DB,
@@ -643,7 +980,6 @@ export async function ingestInboundEmail(
       return { result: "duplicate" };
     }
   }
-
   const threadIds = extractMessageIds([
     parsed.inReplyTo ?? undefined,
     parsed.references ?? undefined,
@@ -654,6 +990,28 @@ export async function ingestInboundEmail(
     subject: parsed.subject ?? "",
     messageIds: threadIds,
   });
+  if (caseId) return { result: "ok", caseId };
+  const forwardSender = await forwardNewSender(env, parsed);
+  // Cloudflare Email Workers do not expose a stable, trusted SPF/DKIM/DMARC
+  // verdict to this code path. A matching From header alone is spoofable, so
+  // fail safe: create no case until the signed-in account holder confirms.
+  if (forwardSender) return { result: "confirmation_required", forwardSender };
+  await auditEvent(env.DB, { type: "inbound_unmatched", severity: "warning", data: { to: parsed.to, subject: parsed.subject } });
+  return { result: "rejected" };
+}
+
+export async function ingestInboundEmail(
+  env: Env,
+  parsed: InboundParsed,
+): Promise<{ result: string; caseId?: string }> {
+  const pre = await preflightInbound(env, parsed);
+  if (pre.result === "confirmation_required" && pre.forwardSender) {
+    const sent = await sendForwardStartConfirmation(env, pre.forwardSender, parsed);
+    return { result: sent ? "confirmation_sent" : "confirmation_limited" };
+  }
+  if (pre.result !== "ok") return { result: pre.result };
+
+  const caseId = pre.caseId;
   if (!caseId) {
     await auditEvent(env.DB, { type: "inbound_unmatched", severity: "warning", data: { to: parsed.to, subject: parsed.subject } });
     return { result: "rejected" };
@@ -725,10 +1083,13 @@ async function exportAccount(env: Env, uid: string) {
     ["billing_events", `SELECT * FROM billing_events WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`],
     ["companion_pairings", `SELECT id, user_id, label, created_at, revoked_at FROM companion_pairings WHERE user_id = ?`],
     ["connections", `SELECT id, type, provider, label, status, meta, created_at FROM connections WHERE user_id = ?`],
+    ["notification_prefs", `SELECT id, kind, enabled, updated_at FROM notification_prefs WHERE user_id = ?`],
+    ["user_tokens", `SELECT id, kind, expires_at, used_at, created_at FROM user_tokens WHERE user_id = ?`],
+    ["fraud_signals", `SELECT id, case_id, kind, detail, status, created_at FROM fraud_signals WHERE user_id = ?`],
   ];
   const out: Record<string, unknown> = {
     exportedAt: nowIso(),
-    user: await q1(env.DB, `SELECT id, email, created_at FROM users WHERE id = ?`, uid),
+    user: await q1(env.DB, `SELECT id, email, created_at, email_verified_at, tos_accepted_at FROM users WHERE id = ?`, uid),
   };
   // Tolerate databases missing optional V1 tables (additive migrations are
   // applied per-environment): a missing table exports as [] rather than 500ing
@@ -749,30 +1110,38 @@ async function deleteAccount(env: Env, uid: string, sessionToken: string) {
     );
     for (const k of keys) await env.EVIDENCE.delete(k.r2_key).catch(() => undefined);
   }
-  const del = async (sql: string) => run(env.DB, sql, uid);
-  await del(`DELETE FROM external_messages WHERE conversation_id IN (SELECT id FROM external_conversations WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?))`);
-  await del(`DELETE FROM external_conversations WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
-  await del(`DELETE FROM case_evidence WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
-  await del(`DELETE FROM case_claims WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
-  await del(`DELETE FROM case_actions WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
-  await del(`DELETE FROM case_plans WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
-  await del(`DELETE FROM case_mandates WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
-  await del(`DELETE FROM approval_requests WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
-  await del(`DELETE FROM follow_ups WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
-  await del(`DELETE FROM outcome_events WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
-  await del(`DELETE FROM case_events WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
-  await del(`DELETE FROM cost_events WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
-  await del(`DELETE FROM case_escalations WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
-  await del(`DELETE FROM case_deadlines WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`);
-  await del(`DELETE FROM companion_pairings WHERE user_id = ?`);
-  await del(`DELETE FROM attestations WHERE user_id = ?`);
-  await del(`DELETE FROM billing_events WHERE user_id = ?`);
-  await del(`DELETE FROM fraud_signals WHERE user_id = ?`);
-  await del(`DELETE FROM cases WHERE user_id = ?`);
-  await del(`DELETE FROM connections WHERE user_id = ?`);
-  await del(`DELETE FROM sessions WHERE user_id = ?`);
-  await del(`DELETE FROM audit_events WHERE user_id = ?`);
-  await run(env.DB, `DELETE FROM users WHERE id = ?`, uid);
+  // All row deletes run as ONE D1 batch: atomic, so no in-flight write can
+  // insert a child row mid-sequence and break the FK ordering, and it's a
+  // single round trip instead of ~25.
+  const stmts = [
+    `DELETE FROM external_messages WHERE conversation_id IN (SELECT id FROM external_conversations WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?))`,
+    `DELETE FROM external_conversations WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`,
+    `DELETE FROM case_evidence WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`,
+    `DELETE FROM case_claims WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`,
+    `DELETE FROM case_actions WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`,
+    `DELETE FROM case_plans WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`,
+    `DELETE FROM case_mandates WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`,
+    `DELETE FROM approval_requests WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`,
+    `DELETE FROM follow_ups WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`,
+    `DELETE FROM outcome_events WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`,
+    `DELETE FROM case_events WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`,
+    `DELETE FROM cost_events WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`,
+    `DELETE FROM case_escalations WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`,
+    `DELETE FROM case_deadlines WHERE case_id IN (SELECT id FROM cases WHERE user_id = ?)`,
+    `DELETE FROM companion_pairings WHERE user_id = ?`,
+    `DELETE FROM attestations WHERE user_id = ?`,
+    `DELETE FROM billing_events WHERE user_id = ?`,
+    `DELETE FROM fraud_signals WHERE user_id = ?`,
+    `DELETE FROM user_tokens WHERE user_id = ?`,
+    `DELETE FROM notification_prefs WHERE user_id = ?`,
+    `DELETE FROM password_resets WHERE user_id = ?`,
+    `DELETE FROM cases WHERE user_id = ?`,
+    `DELETE FROM connections WHERE user_id = ?`,
+    `DELETE FROM sessions WHERE user_id = ?`,
+    `DELETE FROM audit_events WHERE user_id = ?`,
+    `DELETE FROM users WHERE id = ?`,
+  ].map((sql) => env.DB.prepare(sql).bind(uid));
+  await env.DB.batch(stmts);
   void sessionToken;
 }
 
@@ -805,46 +1174,121 @@ export default {
       return new Response("Company Service", { status: 200 });
     } catch (e) {
       console.error("unhandled", e);
+      await reportError(env, e, { route: new URL(req.url).pathname, kind: "fetch" }).catch(() => {});
       return err(500, "internal error");
     }
   },
 
   // Durable follow-up sweep — the "customer never has to remember" engine.
+  // Also the M9 maintenance driver: monthly lane health + daily D1 backup.
   async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(runFollowUpSweep(env).then((r) => console.log(`[sweep] fired=${r.fired}`)));
+    ctx.waitUntil(
+      (async () => {
+        try {
+          const r = await runFollowUpSweep(env);
+          console.log(`[sweep] fired=${r.fired}`);
+          // M6 monthly lane-health check — gated to once per 30 days inside
+          // the 5-min sweep.
+          if (await healthCheckDue(env.DB)) {
+            const h = await runDirectoryHealthCheck(env);
+            console.log(`[healthcheck] checked=${h.checked} degraded=${h.degraded}`);
+          }
+          // M9 daily D1 export → R2 (JSONL per table + manifest, 30d prune).
+          if (await backupDue(env.DB)) {
+            const b = await runDailyBackup(env);
+            console.log(`[backup] date=${b.date} tables=${b.tables} rows=${b.rows} pruned=${b.pruned}`);
+          }
+        } catch (e) {
+          await reportError(env, e, { route: "scheduled", kind: "sweep" }).catch(() => {});
+          throw e; // keep the failure visible to the cron instrumentation
+        }
+      })(),
+    );
   },
 
   // Inbound email via Cloudflare Email Routing (real public route — a literal
-  // rule on the zone points env.INBOUND_ADDRESS at this handler). Proper MIME
-  // decode via postal-mime; ingestInboundEmail handles domain guard, message-id
-  // dedup, case resolution, metadata retention, attachments, and the untrusted
-  // content pipeline.
+  // rule on the zone points env.INBOUND_ADDRESS at this handler). Burst path
+  // (M9): when the INBOUND_Q queue is bound, the raw MIME lands in R2 and the
+  // heavy ingest runs in the queue consumer with retries; the cheap checks
+  // (domain guard, dedup, case resolution, forward-to-start eligibility) stay
+  // synchronous so unknown mail still gets a real bounce via setReject.
   async email(message: ForwardableEmailMessage, env: Env, _ctx: ExecutionContext): Promise<void> {
     try {
-      const parsed = await PostalMime.parse(message.raw);
-      const to = parsed.to?.[0]?.address ?? message.to ?? "";
-      // Prefer text/plain; fall back to a tag-stripped html render.
-      const body = parsed.text ?? (parsed.html ?? "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
-      const r = await ingestInboundEmail(env, {
-        to,
-        from: parsed.from?.address ?? "",
-        subject: parsed.subject ?? "",
-        body,
-        messageId: parsed.messageId ?? null,
-        inReplyTo: parsed.inReplyTo ?? null,
-        references: parsed.references ?? null,
-        attachments: (parsed.attachments ?? [])
-          .filter((a) => a.disposition === "attachment" && a.filename)
-          .map((a) => ({
-            filename: a.filename ?? "attachment",
-            mimeType: a.mimeType,
-            content: typeof a.content === "string" ? new TextEncoder().encode(a.content) : a.content,
-          })),
-      });
+      const rawBytes = await new Response(message.raw).arrayBuffer();
+      const parsed = await parseInboundRaw(rawBytes, message.to ?? "");
+      const pre = await preflightInbound(env, parsed);
+      if (pre.result === "confirmation_required" && pre.forwardSender) {
+        await sendForwardStartConfirmation(env, pre.forwardSender, parsed);
+        return;
+      }
+      if (pre.result === "rejected") { message.setReject("no matching case"); return; }
+      if (pre.result === "duplicate") return;
+
+      const inboundQ = env.INBOUND_Q;
+      if (inboundQ) {
+        const r2Key = inboundRawKey();
+        await env.EVIDENCE.put(r2Key, rawBytes);
+        await inboundQ.send({ r2Key, caseId: pre.caseId ?? null, enqueuedAt: nowIso() });
+        await auditEvent(env.DB, { type: "inbound_queued", severity: "info", caseId: pre.caseId ?? null, data: { r2Key, to: parsed.to } });
+        return;
+      }
+
+      const r = await ingestInboundEmail(env, parsed);
       if (r.result === "rejected") message.setReject("no matching case");
     } catch (e) {
       await auditEvent(env.DB, { type: "inbound_error", severity: "error", data: { error: String(e) } });
+      await reportError(env, e, { route: "email", kind: "inbound" }).catch(() => {});
       message.setReject("processing error");
     }
   },
+
+  // Queue consumer: burst-absorbing inbound ingest. At-least-once safe —
+  // the consumer re-runs the full ingestInboundEmail pipeline, whose
+  // message-id dedup makes a redelivery after success a no-op. The raw MIME
+  // blob in R2 is deleted after a terminal outcome (success or reject).
+  async queue(batch: MessageBatch<InboundQueueMessage>, env: Env): Promise<void> {
+    for (const msg of batch.messages) {
+      const { r2Key, caseId } = msg.body;
+      try {
+        const obj = await env.EVIDENCE.get(r2Key);
+        if (!obj) {
+          await auditEvent(env.DB, { type: "inbound_queue_missing", severity: "error", data: { r2Key, caseId } });
+          msg.ack();
+          continue;
+        }
+        const raw = await obj.arrayBuffer();
+        const parsed = await parseInboundRaw(raw, "");
+        const r = await ingestInboundEmail(env, parsed);
+        if (r.result === "rejected") {
+          await auditEvent(env.DB, { type: "inbound_queue_rejected", severity: "warning", caseId, data: { r2Key } });
+        }
+        await env.EVIDENCE.delete(r2Key).catch(() => {});
+        msg.ack();
+      } catch (e) {
+        await reportError(env, e, { route: "queue/inbound", kind: "inbound_queue", caseId: caseId ?? undefined }).catch(() => {});
+        msg.retry();
+      }
+    }
+  },
 };
+
+// postal-mime parse → the ingestInboundEmail input shape.
+async function parseInboundRaw(raw: ArrayBuffer, fallbackTo: string): Promise<InboundParsed> {
+  const parsed = await PostalMime.parse(raw);
+  return {
+    to: parsed.to?.[0]?.address ?? fallbackTo,
+    from: parsed.from?.address ?? "",
+    subject: parsed.subject ?? "",
+    body: parsed.text ?? (parsed.html ?? "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim(),
+    messageId: parsed.messageId ?? null,
+    inReplyTo: parsed.inReplyTo ?? null,
+    references: parsed.references ?? null,
+    attachments: (parsed.attachments ?? [])
+      .filter((a) => a.disposition === "attachment" && a.filename)
+      .map((a) => ({
+        filename: a.filename ?? "attachment",
+        mimeType: a.mimeType,
+        content: typeof a.content === "string" ? new TextEncoder().encode(a.content) : a.content,
+      })),
+  };
+}

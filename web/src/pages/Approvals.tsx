@@ -4,6 +4,7 @@ import { api } from "../api";
 export function Approvals({ nav, onChanged }: { nav: (to: string) => void; onChanged: () => void }) {
   const [items, setItems] = useState<any[] | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  const [amounts, setAmounts] = useState<Record<string, string>>({});
 
   const load = useCallback(() => {
     api.approvals().then((r) => setItems(r.approvals)).catch(() => setItems([]));
@@ -12,7 +13,15 @@ export function Approvals({ nav, onChanged }: { nav: (to: string) => void; onCha
 
   async function decide(id: string, optionId: string) {
     setBusy(id);
-    try { await api.decide(id, optionId); load(); onChanged(); } finally { setBusy(null); }
+    try {
+      // confirm_receipt "partial" carries the received amount.
+      const raw = amounts[id];
+      const cents = optionId === "partial" && raw
+        ? Math.round(parseFloat(raw.replace(/[$,]/g, "")) * 100)
+        : undefined;
+      await api.decide(id, optionId, Number.isFinite(cents) ? cents : undefined);
+      load(); onChanged();
+    } finally { setBusy(null); }
   }
 
   return (
@@ -51,6 +60,19 @@ export function Approvals({ nav, onChanged }: { nav: (to: string) => void; onCha
             {a.caseId && (
               <div className="small muted" style={{ marginBottom: 10 }}>
                 <a href={`#/case/${a.caseId}`}>View case →</a>
+              </div>
+            )}
+            {a.kind === "confirm_receipt" && (
+              <div className="field" style={{ maxWidth: 220, marginBottom: 10 }}>
+                <label className="small" htmlFor={`amt-${a.id}`}>Amount received (if partial)</label>
+                <input
+                  id={`amt-${a.id}`}
+                  className="input"
+                  inputMode="decimal"
+                  placeholder="$0.00"
+                  value={amounts[a.id] ?? ""}
+                  onChange={(e) => setAmounts((m) => ({ ...m, [a.id]: e.target.value }))}
+                />
               </div>
             )}
             <div className="option-row">

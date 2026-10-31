@@ -140,6 +140,10 @@ export const VERIFICATION_STATUSES = [
   "VERIFIED",
   "SIMULATED",
   "ASSISTED",
+  // Channel confirmed published on the merchant's official site — a lower
+  // label than VERIFIED (R7): real contact through the lane hasn't been
+  // observed yet, but the address isn't guessed.
+  "CONTACT_CONFIRMED",
   "UNVERIFIED",
 ] as const;
 export type VerificationStatus = (typeof VERIFICATION_STATUSES)[number];

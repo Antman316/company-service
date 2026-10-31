@@ -9,7 +9,7 @@ const PROVIDERS = [
   { id: "local_endpoint", label: "Local model endpoint (Ollama etc.)", fields: [{ k: "base_url", label: "Base URL (e.g. http://localhost:11434/v1)", secret: false }, { k: "model", label: "Model", secret: false }] },
 ];
 
-const AUTOMATION_TONE: Record<string, string> = { SIMULATED: "amber", AUTOMATED: "green", ASSISTED: "blue", MANUAL_HANDOFF: "blue", UNSUPPORTED: "red", TEMPORARILY_UNAVAILABLE: "amber" };
+const AUTOMATION_TONE: Record<string, string> = { SIMULATED: "amber", AUTOMATED: "green", ASSISTED: "blue", CONTACT_CONFIRMED: "blue", MANUAL_HANDOFF: "blue", UNSUPPORTED: "red", TEMPORARILY_UNAVAILABLE: "amber" };
 
 export function Connections() {
   const [conns, setConns] = useState<any[] | null>(null);
@@ -142,15 +142,132 @@ export function Connections() {
                 // never shown as "automated".
                 const honest = cv.verification_status !== "VERIFIED";
                 const label = honest ? cv.verification_status : cv.automation_level;
+                const degraded = cv.health === "degraded";
                 return (
                   <span key={cv.id}
-                    className={`chip chip-${honest ? AUTOMATION_TONE[cv.verification_status] ?? "amber" : "green"}`}
-                    title={`${cv.automation_level} · ${cv.verification_status}${cv.limitations ? " — " + cv.limitations : ""}`}>
+                    className={`chip chip-${degraded ? "amber" : honest ? AUTOMATION_TONE[cv.verification_status] ?? "amber" : "green"}`}
+                    title={`${cv.channel} · ${cv.automation_level} · ${cv.verification_status}${degraded ? " — lane degraded" : ""}${cv.limitations ? " — " + cv.limitations : ""}`}>
                     {cv.channel}: {label.replace(/_/g, " ")}
                   </span>
                 );
               })}
             </div>
+          </div>
+        ))}
+      </div>
+
+      <SecuritySection />
+    </div>
+  );
+}
+
+// M7 — account security: TOTP 2FA enrollment + notification preferences.
+function SecuritySection() {
+  const [me, setMe] = useState<any>(null);
+  const [prefs, setPrefs] = useState<Record<string, boolean> | null>(null);
+  const [enroll, setEnroll] = useState<{ secret: string; otpauth: string } | null>(null);
+  const [code, setCode] = useState("");
+  const [secErr, setSecErr] = useState<string | null>(null);
+  const [secMsg, setSecMsg] = useState<string | null>(null);
+
+  const PREF_LABELS: Record<string, string> = {
+    merchant_replied: "Merchant replies",
+    approval_needed: "Approvals waiting on me",
+    deadline_approaching: "Deadline in 2 days",
+    money_checkin: "Money promised — check-ins",
+    case_resolved: "Case resolved",
+  };
+
+  const load = useCallback(() => {
+    api.me().then((r) => setMe(r.user)).catch(() => setMe(null));
+    api.notificationPrefs().then((r) => setPrefs(r.prefs)).catch(() => setPrefs(null));
+  }, []);
+  useEffect(load, [load]);
+
+  async function confirmEnroll() {
+    setSecErr(null); setSecMsg(null);
+    try {
+      await api.totpConfirm(code);
+      setEnroll(null); setCode("");
+      setSecMsg("Two-factor is on.");
+      load();
+    } catch (e: any) { setSecErr(e.message); }
+  }
+  async function disable() {
+    setSecErr(null); setSecMsg(null);
+    try {
+      await api.totpDisable(code);
+      setCode(""); setSecMsg("Two-factor is off.");
+      load();
+    } catch (e: any) { setSecErr(e.message); }
+  }
+
+  return (
+    <div className="grid grid-2" style={{ marginTop: 16 }}>
+      <div className="card">
+        <div className="section-title" style={{ marginTop: 0 }}>Security</div>
+        <div className="pref-row">
+          <span>Email verification</span>
+          <span className={`chip chip-${me?.emailVerified ? "green" : "amber"}`}>{me?.emailVerified ? "verified" : "pending"}</span>
+        </div>
+        <div className="pref-row">
+          <span>Two-factor (authenticator app)</span>
+          <span className={`chip chip-${me?.totpEnabled ? "green" : ""}`}>{me?.totpEnabled ? "on" : "off"}</span>
+        </div>
+        {!me?.totpEnabled && !enroll && (
+          <button className="btn" style={{ marginTop: 12 }} onClick={async () => {
+            setSecErr(null);
+            try { setEnroll(await api.totpEnroll()); } catch (e: any) { setSecErr(e.message); }
+          }}>Set up two-factor</button>
+        )}
+        {enroll && (
+          <div className="totp-box" style={{ marginTop: 12 }}>
+            <p className="small muted" style={{ margin: 0 }}>
+              Add this secret to your authenticator (or scan the otpauth URI in a QR tool):
+            </p>
+            <span className="totp-secret">{enroll.secret}</span>
+            <div className="field" style={{ marginBottom: 0 }}>
+              <label>Enter the 6-digit code to confirm</label>
+              <input className="input" inputMode="numeric" maxLength={6} value={code} onChange={(e) => setCode(e.target.value)} placeholder="123456" />
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button className="btn btn-primary btn-sm" onClick={confirmEnroll}>Enable</button>
+              <button className="btn btn-ghost btn-sm" onClick={() => { setEnroll(null); setCode(""); }}>Cancel</button>
+            </div>
+          </div>
+        )}
+        {me?.totpEnabled && (
+          <div className="totp-box" style={{ marginTop: 12 }}>
+            <div className="field" style={{ marginBottom: 0 }}>
+              <label>Enter a code to disable 2FA</label>
+              <input className="input" inputMode="numeric" maxLength={6} value={code} onChange={(e) => setCode(e.target.value)} placeholder="123456" />
+            </div>
+            <div><button className="btn btn-ghost btn-sm" onClick={disable}>Disable two-factor</button></div>
+          </div>
+        )}
+        {secErr && <div className="error-box" style={{ marginTop: 10 }}>{secErr}</div>}
+        {secMsg && <div className="notice" style={{ marginTop: 10 }}>{secMsg}</div>}
+      </div>
+
+      <div className="card">
+        <div className="section-title" style={{ marginTop: 0 }}>Email notifications</div>
+        <p className="small muted" style={{ marginTop: 0 }}>
+          Sent from the system mailbox to your account email — never through a case connection.
+        </p>
+        {prefs === null ? <span className="muted small">Loading…</span> : Object.keys(PREF_LABELS).map((k) => (
+          <div className="pref-row" key={k}>
+            <span>{PREF_LABELS[k]}</span>
+            <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+              <input
+                type="checkbox"
+                checked={prefs[k] !== false}
+                onChange={async (e) => {
+                  const on = e.target.checked;
+                  setPrefs({ ...prefs, [k]: on });
+                  try { await api.setNotificationPref(k, on); } catch { setPrefs({ ...prefs, [k]: !on }); }
+                }}
+              />
+            </label>
           </div>
         ))}
       </div>
