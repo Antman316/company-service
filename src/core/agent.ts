@@ -375,7 +375,10 @@ async function executeAction(
 ): Promise<{ continue: boolean; status?: string }> {
   const db = env.DB;
   const companyId = caseRow.company_id ?? "";
-  const adapter = getAdapter(companyId === "cmp_testmerchant" ? "test-merchant" : (await adapterFor(db, companyId)) ?? "");
+  const adapter = getAdapter(
+    companyId === "cmp_testmerchant" ? "test-merchant" : (await adapterFor(db, companyId)) ?? "",
+    env.ENVIRONMENT,
+  );
   const scenario = caseScenario(caseRow);
 
   // Everything that talks to a merchant is a send over the case's channel.
@@ -628,7 +631,7 @@ async function sendMerchantMessage(
   let resultData: Record<string, unknown> = {};
   if (adapterId) {
     const { id: outboundMsgId } = await recordMessage(db, conv, "out", subject, body, "queued");
-    const adapter = getAdapter(adapterId)!;
+    const adapter = getAdapter(adapterId, env.ENVIRONMENT)!;
     const res = await adapter.execute(
       { kind: action.kind, payload: { ...json<Record<string, unknown>>(action.payload_json, {}), scenario, body } },
       ctx,
