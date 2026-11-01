@@ -2,7 +2,7 @@
 
 ## Suite
 
-`npm test` — vitest + `@cloudflare/vitest-pool-workers`, real D1 (local),
+`npm test` — vitest + `@cloudflare/vitest-plugin`, real D1 (local),
 migrations applied via `TEST_MIGRATIONS`. **19/19 green.**
 
 `tests/policy.test.ts` (8): grant classification, prohibited actions,

@@ -20,7 +20,7 @@ async function bound(body: string, recipient = RECIPIENT, mandateVersion = MANDA
   return buildSendBinding({ body, recipient, mandateVersion });
 }
 
-describe.sequential("send-path safety", () => {
+describe("send-path safety", () => {
 describe("per-send approval binding", () => {
   it("accepts a binding of the exact body hash, recipient, and mandate version", async () => {
     const body = disclosed("Please refund order TM-1.");
