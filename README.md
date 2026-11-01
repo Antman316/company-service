@@ -30,7 +30,7 @@ customer's mandate, create approvals for themselves, or turn "promised" into
 | Durable follow-ups | Cron trigger every 5 min + `follow_ups` table |
 | Frontend | React 19 + TypeScript + Vite, served from the Worker |
 | Model layer | `ModelProvider` interface — `local_dev` (deterministic), `openai`, `anthropic`, `openai_compatible` |
-| Tests | vitest + `@cloudflare/vitest-pool-workers` (93 `it()` cases under `tests/`) |
+| Tests | vitest + `@cloudflare/vitest-plugin` (99 `it()` cases under `tests/`) |
 
 ## Run locally
 
