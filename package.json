@@ -19,14 +19,14 @@
     "react-dom": "^19.1.0"
   },
   "devDependencies": {
-    "@cloudflare/vite-plugin": "^1.13.0",
+    "@cloudflare/vite-plugin": "^1.66.0",
     "@cloudflare/vitest-plugin": "^1.4.11",
     "@types/react": "^19.1.0",
     "@types/react-dom": "^19.1.0",
     "@vitejs/plugin-react": "^4.6.0",
     "typescript": "^5.8.0",
-    "vite": "^6.3.0",
+    "vite": "^6.4.5",
     "vitest": "^5.0.5",
-    "wrangler": "^4.40.0"
+    "wrangler": "^4.154.0"
   }
 }
