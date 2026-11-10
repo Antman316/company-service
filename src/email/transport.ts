@@ -123,41 +123,6 @@ async function resendSend(cfg: ResendCfg, msg: OutboundEmail): Promise<SendResul
   }
 }
 
-// Cloudflare-native transport: the Email Routing `send_email` binding on the
-// same zone. Zero external credentials — sends through the zone's real SMTP
-// path with managed DKIM/SPF. Minimal permission by construction.
-async function cloudflareSend(env: Env, msg: OutboundEmail): Promise<SendResult> {
-  if (!env.MAILOUT) {
-    return { ok: false, transport: "cloudflare_send_email", error: "MAILOUT binding not configured" };
-  }
-  if (!hasDisclosedAssistance(msg.body)) {
-    return { ok: false, transport: "cloudflare_send_email", error: DISCLOSURE_REJECTION };
-  }
-  const fromAddr = env.INBOUND_ADDRESS ?? "cases@agentmasterkey.com";
-  const raw = [
-    `From: ${env.EMAIL_FROM ?? `Company Service <${fromAddr}>`}`,
-    `To: ${msg.to}`,
-    `Subject: ${msg.subject}`,
-    msg.replyTo ? `Reply-To: ${msg.replyTo}` : "",
-    msg.messageId ? `Message-ID: <${msg.messageId}>` : "",
-    `MIME-Version: 1.0`,
-    `Content-Type: text/plain; charset=utf-8`,
-    ``,
-    msg.body,
-  ].filter(Boolean).join("\r\n");
-  try {
-    const { EmailMessage } = await import("cloudflare:email");
-    await env.MAILOUT.send(new EmailMessage(fromAddr, msg.to, raw));
-    return {
-      ok: true,
-      transport: "cloudflare_send_email",
-      externalId: msg.messageId ? `<${msg.messageId}>` : undefined,
-    };
-  } catch (e) {
-    return { ok: false, transport: "cloudflare_send_email", error: String(e) };
-  }
-}
-
 // Route an outbound case email. Organization keys are never a silent fallback.
 export async function sendCaseEmail(
   env: Env,

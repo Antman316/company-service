@@ -40,6 +40,15 @@ export function Approvals({ nav, onChanged }: { nav: (to: string) => void; onCha
           <div className="approval-card" key={a.id}>
             <div className="kind">{a.kind.replace(/_/g, " ")}</div>
             <div className="summary">{a.summary}</div>
+            {a.kind === "send_binding" && a.detail?.body && (
+              <details style={{ margin: "8px 0" }} open>
+                <summary className="small" style={{ cursor: "pointer" }}>Review the exact email — approving sends these exact bytes</summary>
+                {a.detail.recipient && (
+                  <div className="small muted" style={{ marginTop: 6 }}>To: {a.detail.recipient}</div>
+                )}
+                <pre className="small" style={{ whiteSpace: "pre-wrap", maxHeight: 320, overflow: "auto", marginTop: 6 }}>{a.detail.body}</pre>
+              </details>
+            )}
             {a.detail?.payload?.draft && (
               <details style={{ margin: "8px 0" }}>
                 <summary className="small" style={{ cursor: "pointer" }}>View the draft — you review and file it yourself</summary>

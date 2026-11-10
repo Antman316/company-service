@@ -630,8 +630,22 @@ async function sendMerchantMessage(
 
   let resultData: Record<string, unknown> = {};
   if (adapterId) {
+    // Adapter lane is simulation-only. The per-send approval gate
+    // (ensureBoundEmailSend) lives on the email channel path below — this
+    // branch must never perform a real send. test-merchant is the only
+    // registered adapter and it is a deterministic sim; a future adapter
+    // that sends real mail must be wired through the gated email path,
+    // not executed here. Fail closed rather than bypass the gate.
+    const adapter = getAdapter(adapterId, env.ENVIRONMENT);
+    if (adapterId !== "test-merchant" || !adapter) {
+      const error = adapter
+        ? "adapter lane is simulation-only — real sends require the per-send approval gate"
+        : `unknown adapter: ${adapterId}`;
+      await run(db, `UPDATE case_actions SET status='failed', error=? WHERE id=?`, error, action.id);
+      await caseEvent(db, caseRow.id, "action_failed", "policy", { actionId: action.id, adapterId, error });
+      return { continue: true };
+    }
     const { id: outboundMsgId } = await recordMessage(db, conv, "out", subject, body, "queued");
-    const adapter = getAdapter(adapterId, env.ENVIRONMENT)!;
     const res = await adapter.execute(
       { kind: action.kind, payload: { ...json<Record<string, unknown>>(action.payload_json, {}), scenario, body } },
       ctx,
