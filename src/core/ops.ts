@@ -134,31 +134,66 @@ export async function pruneExpiredBackups(
   return { pruned, retentionDays, days: dayList };
 }
 
+// Child-before-parent export order (reverse topological over the declared FK
+// graph). A captured child row then implies its parents were committed before
+// the child export and are exported later — every captured set is ancestor-
+// closed and replays cleanly under concurrent inserts. Alphabetical order can
+// capture a child written mid-run without its parent and produce backup sets
+// that fail FOREIGN KEY on restore.
+async function exportOrder(db: D1Database, names: string[]): Promise<string[]> {
+  const children = new Map<string, Set<string>>(names.map((n) => [n, new Set<string>()]));
+  try {
+    for (const n of names) {
+      for (const fk of await q<{ table: string }>(db, `PRAGMA foreign_key_list("${n}")`)) {
+        if (fk.table !== n && children.has(fk.table)) children.get(fk.table)!.add(n);
+      }
+    }
+  } catch {
+    return names.slice().sort(); // pragma unavailable — keep prior behavior
+  }
+  const order: string[] = [];
+  const done = new Set<string>();
+  for (;;) {
+    const ready = names
+      .filter((n) => !done.has(n) && [...children.get(n)!].every((c) => done.has(c)))
+      .sort();
+    if (!ready.length) break;
+    for (const n of ready) {
+      order.push(n);
+      done.add(n);
+    }
+  }
+  for (const n of names.filter((n) => !done.has(n)).sort()) order.push(n); // cycle fallback
+  return order;
+}
+
+async function exportTable(env: Env, date: string, name: string): Promise<number> {
+  let offset = 0;
+  const lines: string[] = [];
+  for (;;) {
+    const page = await q<Record<string, unknown>>(env.DB, `SELECT * FROM "${name}" LIMIT 500 OFFSET ${offset}`);
+    for (const row of page) lines.push(JSON.stringify(row));
+    offset += page.length;
+    if (page.length < 500) break;
+  }
+  await env.EVIDENCE.put(`${BACKUP_PREFIX}${date}/${name}.jsonl`, lines.join("\n") + (lines.length ? "\n" : ""));
+  return lines.length;
+}
+
 export async function runDailyBackup(env: Env): Promise<{ date: string; tables: number; rows: number; pruned: number }> {
   const date = nowIso().slice(0, 10);
   const tables = await q<{ name: string }>(
     env.DB,
     `SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'd1_%' AND name NOT LIKE '_cf_%' AND name NOT LIKE 'deploy_stage%' ORDER BY name`,
   );
+  const names = tables.map((t) => t.name);
   let total = 0;
   const manifest: Record<string, number> = {};
-  for (const t of tables) {
-    let offset = 0;
-    const lines: string[] = [];
-    for (;;) {
-      const page = await q<Record<string, unknown>>(env.DB, `SELECT * FROM "${t.name}" LIMIT 500 OFFSET ${offset}`);
-      for (const row of page) lines.push(JSON.stringify(row));
-      offset += page.length;
-      if (page.length < 500) break;
-    }
-    await env.EVIDENCE.put(`${BACKUP_PREFIX}${date}/${t.name}.jsonl`, lines.join("\n") + (lines.length ? "\n" : ""));
-    manifest[t.name] = lines.length;
-    total += lines.length;
+  for (const name of await exportOrder(env.DB, names)) {
+    const n = await exportTable(env, date, name);
+    manifest[name] = n;
+    total += n;
   }
-  await env.EVIDENCE.put(
-    `${BACKUP_PREFIX}${date}/manifest.json`,
-    JSON.stringify({ generatedAt: nowIso(), environment: env.ENVIRONMENT ?? "unknown", tables: manifest }),
-  );
 
   // Retention: drop backup days older than BACKUP_RETENTION_DAYS (default 30).
   const { pruned, retentionDays: retention } = await pruneExpiredBackups(env);
@@ -168,6 +203,18 @@ export async function runDailyBackup(env: Env): Promise<{ date: string; tables: 
     severity: "info",
     data: { date, tables: tables.length, rows: total, pruned, retentionDays: retention },
   });
+  // The backup_run audit row lands after audit_events was exported; re-export
+  // it so the set contains the record of its own run, and write the manifest
+  // LAST so every manifest count matches its file exactly.
+  if (names.includes("audit_events")) {
+    const n = await exportTable(env, date, "audit_events");
+    total += n - (manifest["audit_events"] ?? 0);
+    manifest["audit_events"] = n;
+  }
+  await env.EVIDENCE.put(
+    `${BACKUP_PREFIX}${date}/manifest.json`,
+    JSON.stringify({ generatedAt: nowIso(), environment: env.ENVIRONMENT ?? "unknown", tables: manifest }),
+  );
   return { date, tables: tables.length, rows: total, pruned };
 }
 
