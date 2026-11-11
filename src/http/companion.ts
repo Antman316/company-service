@@ -12,6 +12,7 @@ import { advanceCase, ensureConversation, ingestMerchantMessage } from "../core/
 import { transitionCase } from "../core/caseEngine";
 import { scheduleFollowUp } from "../core/followups";
 import { requireCsrf } from "./auth";
+import { readJson } from "./body";
 
 type Session = { userId: string; csrf: string; token: string } | null;
 
@@ -162,7 +163,7 @@ export async function handleCompanion(
 
   // ---- unauthenticated token exchange (the short code IS the credential) ----
   if (path === "/api/companion/pair" && req.method === "POST") {
-    const b = (await req.json()) as { code?: string; label?: string };
+    const b = (await readJson(req)) as { code?: string; label?: string };
     const code = (b.code ?? "").trim().toUpperCase();
     if (code.length < 6) return err(400, "invalid code");
     // Crude global throttle on failed exchanges (D1 counter, audited).
@@ -200,7 +201,7 @@ export async function handleCompanion(
     // A session user can also revoke a pairing they own.
     if (path === "/api/companion/revoke" && req.method === "POST" && session) {
       if (!requireCsrf(req, session)) return err(403, "csrf token missing or invalid");
-      const b = (await req.json()) as { pairingId?: string };
+      const b = (await readJson(req)) as { pairingId?: string };
       const owned = await q1<{ id: string }>(
         db,
         `SELECT id FROM companion_pairings WHERE id = ? AND user_id = ? AND revoked_at IS NULL`,
@@ -297,7 +298,7 @@ export async function handleCompanion(
 
   // Streamed merchant chat text → same UNTRUSTED ingest as pasted replies.
   if (path === "/api/companion/reply" && req.method === "POST") {
-    const b = (await req.json()) as { caseId?: string; body?: string };
+    const b = (await readJson(req)) as { caseId?: string; body?: string };
     const owned = await ownedCase(b.caseId);
     if (!owned) return err(404, "case not found");
     if (!b.body?.trim()) return err(400, "empty reply");
@@ -314,7 +315,7 @@ export async function handleCompanion(
 
   // "I sent it" — same semantic as the assisted/sent web flow.
   if (path === "/api/companion/sent" && req.method === "POST") {
-    const b = (await req.json()) as { caseId?: string };
+    const b = (await readJson(req)) as { caseId?: string };
     const owned = await ownedCase(b.caseId);
     if (!owned) return err(404, "case not found");
     const act = await q1<{ id: string }>(
@@ -332,7 +333,7 @@ export async function handleCompanion(
 
   // Regenerate — advance the case one step (draft refresh, follow-up, etc.).
   if (path === "/api/companion/run" && req.method === "POST") {
-    const b = (await req.json()) as { caseId?: string };
+    const b = (await readJson(req)) as { caseId?: string };
     const owned = await ownedCase(b.caseId);
     if (!owned) return err(404, "case not found");
     const outcome = await advanceCase(env, owned.id, "companion_run");
@@ -342,7 +343,7 @@ export async function handleCompanion(
 
   // End-of-chat wrap-up: full transcript lands as case evidence.
   if (path === "/api/companion/wrapup" && req.method === "POST") {
-    const b = (await req.json()) as { caseId?: string; transcript?: string; reference?: string };
+    const b = (await readJson(req)) as { caseId?: string; transcript?: string; reference?: string };
     const owned = await ownedCase(b.caseId);
     if (!owned) return err(404, "case not found");
     if (!b.transcript?.trim()) return err(400, "empty transcript");

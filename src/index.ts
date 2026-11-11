@@ -24,6 +24,7 @@ import { extractMessageIds, resolveInboundCase } from "./email/threading";
 import PostalMime from "postal-mime";
 import { encryptJson } from "./security/crypto";
 import { createSession, getSession, requireCsrf, signin, signout, signup } from "./http/auth";
+import { HttpError, readJson } from "./http/body";
 import { handleCompanion } from "./http/companion";
 import {
   confirmPasswordReset, getNotificationPrefs, requestPasswordReset,
@@ -87,7 +88,7 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
     return res({ turnstileSiteKey: env.TURNSTILE_SECRET ? (env.TURNSTILE_SITE_KEY ?? null) : null });
   }
   if (path === "/api/auth/signup" && req.method === "POST") {
-    const b = (await req.json()) as { email?: string; password?: string; consent?: boolean; turnstile?: string };
+    const b = (await readJson(req)) as { email?: string; password?: string; consent?: boolean; turnstile?: string };
     if (b.consent !== true) return err(400, "consent to the Terms and Privacy Policy is required");
     if (!(await verifyTurnstile(env, b.turnstile, req))) return err(400, "human check failed — try again");
     const r = await signup(env.DB, b.email ?? "", b.password ?? "");
@@ -100,7 +101,7 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
     return res({ ok: true, csrf: sess.csrf, emailVerified: false }, { headers: { "Set-Cookie": sess.cookie } });
   }
   if (path === "/api/auth/signin" && req.method === "POST") {
-    const b = (await req.json()) as { email?: string; password?: string };
+    const b = (await readJson(req)) as { email?: string; password?: string };
     const s = await signin(env.DB, b.email ?? "", b.password ?? "");
     if (!s.ok) return err(401, s.error);
     // TOTP gate — password verified but the second factor decides the session.
@@ -110,7 +111,7 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
     return res({ ok: true, csrf: sess.csrf }, { headers: { "Set-Cookie": sess.cookie } });
   }
   if (path === "/api/auth/totp/challenge" && req.method === "POST") {
-    const b = (await req.json()) as { ticket?: string; code?: string };
+    const b = (await readJson(req)) as { ticket?: string; code?: string };
     const r = await totpChallengeRedeem(env, b.ticket ?? "", b.code ?? "");
     if (!r.ok) return err(401, r.error ?? "challenge failed");
     const sess = await createSession(env.DB, r.userId!, secure);
@@ -122,12 +123,12 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
     return verifyEmailLink(env, url.searchParams.get("token") ?? "");
   }
   if (path === "/api/auth/reset-request" && req.method === "POST") {
-    const b = (await req.json()) as { email?: string };
+    const b = (await readJson(req)) as { email?: string };
     if (b.email) await requestPasswordReset(env, b.email);
     return res({ ok: true });
   }
   if (path === "/api/auth/reset-confirm" && req.method === "POST") {
-    const b = (await req.json()) as { token?: string; password?: string };
+    const b = (await readJson(req)) as { token?: string; password?: string };
     const r = await confirmPasswordReset(env, b.token ?? "", b.password ?? "");
     if (!r.ok) return err(400, r.error ?? "reset failed");
     return res({ ok: true });
@@ -135,7 +136,7 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
   // Public abuse inbox — §11. Stored as a fraud signal; rate-limited by
   // reporter address so the inbox itself can't be flooded.
   if (path === "/api/abuse/report" && req.method === "POST") {
-    const b = (await req.json()) as { email?: string; caseId?: string; body?: string };
+    const b = (await readJson(req)) as { email?: string; caseId?: string; body?: string };
     const body = (b.body ?? "").trim();
     if (body.length < 10) return err(400, "tell us what happened in a sentence or two");
     const reporter = (b.email ?? "anonymous").trim().toLowerCase().slice(0, 120);
@@ -204,13 +205,13 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
     return res({ ok: true, secret: r.secret, otpauth: r.otpauth });
   }
   if (path === "/api/auth/totp/confirm" && req.method === "POST") {
-    const b = (await req.json()) as { code?: string };
+    const b = (await readJson(req)) as { code?: string };
     const r = await totpConfirm(env, uid, b.code ?? "");
     if (!r.ok) return err(400, r.error ?? "confirm failed");
     return res({ ok: true });
   }
   if (path === "/api/auth/totp/disable" && req.method === "POST") {
-    const b = (await req.json()) as { code?: string };
+    const b = (await readJson(req)) as { code?: string };
     const r = await totpDisable(env, uid, b.code ?? "");
     if (!r.ok) return err(400, r.error ?? "disable failed");
     return res({ ok: true });
@@ -219,7 +220,7 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
     return res({ prefs: await getNotificationPrefs(env, uid) });
   }
   if (path === "/api/notifications/prefs" && req.method === "PUT") {
-    const b = (await req.json()) as { kind?: string; enabled?: boolean };
+    const b = (await readJson(req)) as { kind?: string; enabled?: boolean };
     const r = await setNotificationPref(env, uid, b.kind ?? "", b.enabled === true);
     if (!r.ok) return err(400, r.error ?? "pref failed");
     return res({ ok: true });
@@ -228,7 +229,7 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
     if ((await activeCaseCount(env.DB, uid)) >= MAX_ACTIVE_CASES_PER_USER) {
       return err(429, `case limit reached — resolve or pause an open case first (max ${MAX_ACTIVE_CASES_PER_USER} active)`);
     }
-    const b = (await req.json()) as { token?: string };
+    const b = (await readJson(req)) as { token?: string };
     const hit = await consumeUserToken(env.DB, b.token ?? "", "forward_start", uid);
     const subject = typeof hit?.payload.subject === "string" ? hit.payload.subject : "";
     const body = typeof hit?.payload.body === "string" ? hit.payload.body : "";
@@ -290,7 +291,7 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
     return res({ cases, pendingApprovals: pending.length });
   }
   if (path === "/api/cases" && req.method === "POST") {
-    const b = (await req.json()) as {
+    const b = (await readJson(req)) as {
       text?: string; scenario?: string;
       startingState?: { daysOverdue?: number; priorAttempts?: number; refundInProgress?: boolean };
     };
@@ -346,7 +347,7 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
         }
         return err(400, "no file in upload");
       }
-      const b = (await req.json()) as { kind?: string; text?: string; label?: string };
+      const b = (await readJson(req)) as { kind?: string; text?: string; label?: string };
       if (!b.text) return err(400, "text required for non-file evidence");
       const id = await addEvidence(env.DB, env, caseId, {
         kind: (b.kind as never) ?? "note", text: b.text, label: b.label,
@@ -359,7 +360,7 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
     // possible, else the customer-entered amount — the document itself is the
     // verification, not the parsed figure.
     if (sub === "/receipt-evidence" && req.method === "POST") {
-      const b = (await req.json()) as { text?: string; evidenceId?: string; amountCents?: number };
+      const b = (await readJson(req)) as { text?: string; evidenceId?: string; amountCents?: number };
       let evidenceId: string;
       let docText: string | null = null;
       if (b.evidenceId) {
@@ -450,7 +451,7 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
       return res({ ok: true });
     }
     if (sub === "/assisted/reply" && req.method === "POST") {
-      const b = (await req.json()) as { body?: string };
+      const b = (await readJson(req)) as { body?: string };
       if (!b.body?.trim()) return err(400, "paste the reply you received");
       const caseRow = await getCase(env.DB, caseId);
       if (!caseRow) return err(404, "case not found");
@@ -469,7 +470,7 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
       return res({ ok: true, case: outcome });
     }
     if (sub === "/mandate" && req.method === "POST") {
-      const b = (await req.json()) as {
+      const b = (await readJson(req)) as {
         authorized?: string[]; approvalRequired?: string[]; prohibited?: string[]; expiresAt?: string;
       };
       if (!b.authorized?.length) return err(400, "mandate must authorize at least one capability");
@@ -512,7 +513,7 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
     }
     if (sub === "/deadlines" && req.method === "POST") {
       // Customer-entered deadlines — always labeled CUSTOMER_STATED (R18).
-      const b = (await req.json()) as { kind?: string; dueAt?: string; note?: string };
+      const b = (await readJson(req)) as { kind?: string; dueAt?: string; note?: string };
       const kind = b.kind ?? "";
       if (!["promised_date", "return_window", "chargeback_window", "complaint_window"].includes(kind)) {
         return err(400, "kind must be promised_date|return_window|chargeback_window|complaint_window");
@@ -531,7 +532,7 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
       // Customer-entered case facts that templates consume (card type,
       // statement date, return-window end). Stored on cases.meta; derived
       // deadlines are labeled CUSTOMER_STATED.
-      const b = (await req.json()) as { cardType?: string; statementDate?: string; returnWindowEnd?: string };
+      const b = (await readJson(req)) as { cardType?: string; statementDate?: string; returnWindowEnd?: string };
       const updates: string[] = [];
       const binds: unknown[] = [];
       if (b.cardType != null) {
@@ -603,7 +604,7 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
       });
     }
     if (sub === "/message" && req.method === "POST") {
-      const b = (await req.json()) as { text?: string };
+      const b = (await readJson(req)) as { text?: string };
       if (!b.text?.trim()) return err(400, "text required");
       await addEvidence(env.DB, env, caseId, { kind: "note", text: b.text.trim(), label: "Customer note" });
       await caseEvent(env.DB, caseId, "customer_note", "customer", { text: b.text.trim().slice(0, 300) });
@@ -631,7 +632,7 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
   }
   const aprMatch = path.match(/^\/api\/approvals\/([^/]+)\/decide$/);
   if (aprMatch && req.method === "POST") {
-    const b = (await req.json()) as { optionId?: string; amountCents?: number };
+    const b = (await readJson(req)) as { optionId?: string; amountCents?: number };
     // Ownership check via case join.
     const row = await q1<{ case_id: string }>(
       env.DB,
@@ -662,7 +663,7 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
       });
     }
     if (req.method === "POST") {
-      const b = (await req.json()) as {
+      const b = (await readJson(req)) as {
         type?: string; provider?: string; label?: string; config?: Record<string, string>;
       };
       if (!b.type || !b.provider || !b.label) return err(400, "type, provider, label required");
@@ -758,7 +759,7 @@ async function api(req: Request, ctx: Ctx): Promise<Response> {
   // ---- demo inbound email (dev/test only) ----
   if (path === "/api/sim/inbound" && req.method === "POST") {
     if (env.ENVIRONMENT === "production") return err(403, "simulation disabled in production");
-    const b = (await req.json()) as { to?: string; subject?: string; body?: string; from?: string };
+    const b = (await readJson(req)) as { to?: string; subject?: string; body?: string; from?: string };
     const caseId = await resolveInboundCase(env.DB, { to: b.to ?? "", subject: b.subject ?? "" });
     if (!caseId) return err(404, "no case matched inbound message");
     await ingestInboundText(env, caseId, b.body ?? "");
@@ -1185,6 +1186,9 @@ export default {
       }
       return new Response("Company Service", { status: 200 });
     } catch (e) {
+      // Client-side request faults (bad JSON, wrong content type) are clean
+      // 4xx answers — not worker errors and not worth an error report.
+      if (e instanceof HttpError) return err(e.status, e.message);
       console.error("unhandled", e);
       await reportError(env, e, { route: new URL(req.url).pathname, kind: "fetch" }).catch(() => {});
       return err(500, "internal error");
