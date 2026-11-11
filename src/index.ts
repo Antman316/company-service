@@ -1264,8 +1264,27 @@ export default {
   // blob in R2 is deleted after a terminal outcome (success or reject).
   async queue(batch: MessageBatch<InboundQueueMessage>, env: Env): Promise<void> {
     for (const msg of batch.messages) {
-      const { r2Key, caseId } = msg.body;
+      // Validate the body inside the per-message boundary: an out-of-contract
+      // body (null, non-object, missing/non-string r2Key) must not escape the
+      // try and strand every sibling in the batch. It can never resolve a
+      // blob, so it is dead-letter material — audit and ack it once instead
+      // of burning max_retries and dropping the whole batch silently.
+      const body = msg.body as Partial<InboundQueueMessage> | null;
+      const r2Key = typeof body?.r2Key === "string" && body.r2Key ? body.r2Key : null;
+      const caseId = typeof body?.caseId === "string" ? body.caseId : null;
       try {
+        if (!r2Key) {
+          await auditEvent(env.DB, {
+            type: "inbound_queue_poison",
+            severity: "error",
+            caseId,
+            data: {
+              bodyPreview: (typeof body === "object" && body !== null ? JSON.stringify(body) : String(body)).slice(0, 300),
+            },
+          });
+          msg.ack();
+          continue;
+        }
         const obj = await env.EVIDENCE.get(r2Key);
         if (!obj) {
           await auditEvent(env.DB, { type: "inbound_queue_missing", severity: "error", data: { r2Key, caseId } });
