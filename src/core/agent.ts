@@ -513,7 +513,7 @@ async function ensureBoundEmailSend(
   };
 }
 
-async function sendMerchantMessage(
+export async function sendMerchantMessage(
   env: Env,
   caseRow: CaseRow,
   action: { id: string; kind: string; payload_json: string | null },
