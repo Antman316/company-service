@@ -57,7 +57,12 @@ describe("M9 ops & reliability", () => {
     const c = await signup("m9b@test.local");
     const caseId = await createTestCase(c, "workflow-less env");
     await grantMandate(c, caseId);
-    const fupId = await scheduleFollowUp(env.DB, caseId, "merchant_check", nowIso(), { via: "test" }, env);
+    const fupId = await scheduleFollowUp(env.DB, caseId, "merchant_check", new Date(Date.now() + 3600_000).toISOString(), { via: "test" }, env);
+    // Not yet due — the point is that the row sits 'pending' for the cron
+    // backstop. (A due-now row is legally claimable by any concurrently
+    // running sweep on this suite's shared D1, which made this flaky.)
+    // WO-2 port note: identical intent to pon-20261109/wo2's m9 hunk, kept
+    // against the landed markFired API.
     const row = await dbOne<{ status: string }>(`SELECT status FROM follow_ups WHERE id = ?`, fupId);
     expect(row?.status).toBe("pending");
   });
